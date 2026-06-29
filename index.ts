@@ -399,6 +399,9 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           signal?.removeEventListener("abort", onAbort);
 
+          // Clean up bwrap mount point files created on Linux
+          SandboxManager.cleanupAfterCommand();
+
           if (signal?.aborted) {
             reject(new Error("aborted"));
           } else if (timedOut) {
