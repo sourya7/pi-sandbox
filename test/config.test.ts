@@ -14,7 +14,6 @@ test("deepMerge merges sections while replacing configured arrays", () => {
       allowWrite: ["/work"],
       denyWrite: DEFAULT_CONFIG.filesystem?.denyWrite ?? [],
     },
-    allowBrowserProcess: true,
   });
 
   assert.equal(merged.enabled, false);
@@ -22,7 +21,6 @@ test("deepMerge merges sections while replacing configured arrays", () => {
   assert.deepEqual(merged.network?.deniedDomains, []);
   assert.deepEqual(merged.filesystem?.allowWrite, ["/work"]);
   assert.deepEqual(merged.filesystem?.denyWrite, DEFAULT_CONFIG.filesystem?.denyWrite);
-  assert.equal(merged.allowBrowserProcess, true);
 });
 
 test("a later merge takes precedence over global configuration", () => {

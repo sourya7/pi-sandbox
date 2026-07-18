@@ -1,6 +1,5 @@
 {
   "enabled": true,
-  "allowBrowserProcess": true,
   "network": {
     "allowLocalBinding": true,
     "allowAllUnixSockets": true,

@@ -5,7 +5,7 @@ import {
   SandboxManager,
   type SandboxAskCallback,
   type SandboxRuntimeConfig,
-} from "@carderne/sandbox-runtime";
+} from "@anthropic-ai/sandbox-runtime";
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
@@ -40,7 +40,6 @@ export function buildRuntimeConfig(
     },
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
-    allowBrowserProcess: config.allowBrowserProcess,
     enableWeakerNetworkIsolation: true,
   };
 }
