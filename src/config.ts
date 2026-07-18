@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
@@ -7,6 +6,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
+}
+
+export interface SandboxConfigPaths {
+  globalBasePath: string;
+  globalModePath?: string;
+  projectBasePath: string;
+  projectModePath?: string;
 }
 
 export const DEFAULT_CONFIG: SandboxConfig = {
@@ -34,12 +40,34 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   },
 };
 
+function mergeList(base?: string[], override?: string[]): string[] | undefined {
+  if (!base && !override) return undefined;
+  return [...new Set([...(base ?? []), ...(override ?? [])])];
+}
+
 export function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
   const result: SandboxConfig = { ...base };
 
   if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
-  if (overrides.network) result.network = { ...base.network, ...overrides.network };
-  if (overrides.filesystem) result.filesystem = { ...base.filesystem, ...overrides.filesystem };
+  if (overrides.network) {
+    result.network = {
+      ...base.network,
+      ...overrides.network,
+      allowedDomains:
+        mergeList(base.network?.allowedDomains, overrides.network.allowedDomains) ?? [],
+      deniedDomains: mergeList(base.network?.deniedDomains, overrides.network.deniedDomains) ?? [],
+    };
+  }
+  if (overrides.filesystem) {
+    result.filesystem = {
+      ...base.filesystem,
+      ...overrides.filesystem,
+      allowRead: mergeList(base.filesystem?.allowRead, overrides.filesystem.allowRead) ?? [],
+      denyRead: mergeList(base.filesystem?.denyRead, overrides.filesystem.denyRead) ?? [],
+      allowWrite: mergeList(base.filesystem?.allowWrite, overrides.filesystem.allowWrite) ?? [],
+      denyWrite: mergeList(base.filesystem?.denyWrite, overrides.filesystem.denyWrite) ?? [],
+    };
+  }
 
   if (overrides.ignoreViolations) result.ignoreViolations = overrides.ignoreViolations;
   if (overrides.enableWeakerNestedSandbox !== undefined) {
@@ -59,19 +87,36 @@ function readJsonConfig(configPath: string, warn: boolean): Partial<SandboxConfi
   }
 }
 
-export function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
+function modeSuffix(mode: string): string {
+  return mode && mode !== "default" ? `.${mode}` : "";
+}
+
+export function getConfigPaths(cwd: string, mode = "default"): SandboxConfigPaths {
+  const suffix = modeSuffix(mode);
   return {
-    globalPath: join(homedir(), ".pi", "agent", "sandbox.json"),
-    projectPath: join(cwd, ".pi", "sandbox.json"),
+    globalBasePath: join(getAgentDir(), "sandbox.json"),
+    globalModePath: suffix ? join(getAgentDir(), `sandbox${suffix}.json`) : undefined,
+    projectBasePath: join(cwd, ".pi", "sandbox.json"),
+    projectModePath: suffix ? join(cwd, ".pi", `sandbox${suffix}.json`) : undefined,
   };
 }
 
-export function loadConfig(cwd: string): SandboxConfig {
-  const projectConfigPath = join(cwd, ".pi", "sandbox.json");
-  const globalConfigPath = join(getAgentDir(), "sandbox.json");
-  const globalConfig = readJsonConfig(globalConfigPath, true);
-  const projectConfig = readJsonConfig(projectConfigPath, true);
-  return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+export function loadConfig(cwd: string, mode = "default"): SandboxConfig {
+  const paths = getConfigPaths(cwd, mode);
+  const globalBaseConfig = readJsonConfig(paths.globalBasePath, true);
+  const globalModeConfig = paths.globalModePath ? readJsonConfig(paths.globalModePath, true) : {};
+  const projectBaseConfig = readJsonConfig(paths.projectBasePath, true);
+  const projectModeConfig = paths.projectModePath
+    ? readJsonConfig(paths.projectModePath, true)
+    : {};
+
+  return deepMerge(
+    deepMerge(
+      deepMerge(deepMerge(DEFAULT_CONFIG, globalBaseConfig), globalModeConfig),
+      projectBaseConfig,
+    ),
+    projectModeConfig,
+  );
 }
 
 function writeConfigFile(configPath: string, config: Partial<SandboxConfig>): void {

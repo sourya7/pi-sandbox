@@ -1,7 +1,8 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
-import { type SandboxConfig } from "./config.ts";
+import { type SandboxConfig, type SandboxConfigPaths } from "./config.ts";
+import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
@@ -151,22 +152,38 @@ export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxCo
   );
 }
 
-export function formatSandboxStatus(config: SandboxConfig): string {
+export function formatSandboxStatus(config: SandboxConfig, mode = DEFAULT_MODE): string {
   const networkLabel = allowsAllDomains(config.network?.allowedDomains)
     ? "all domains"
     : `${config.network?.allowedDomains?.length ?? 0} domains`;
-  return `🔒 Sandbox: ${networkLabel}, ${config.filesystem?.allowWrite?.length ?? 0} write paths`;
+  const policy = getModePolicy(mode);
+  const writeLabel =
+    policy.write === "deny"
+      ? "writes denied"
+      : `${config.filesystem?.allowWrite?.length ?? 0} write paths`;
+  return `🔒 Sandbox: ${mode}, ${networkLabel}, ${writeLabel}`;
 }
 
 export function formatSandboxConfiguration(
   config: SandboxConfig,
-  paths: { globalPath: string; projectPath: string },
+  paths: SandboxConfigPaths,
   allowances: SessionAllowances,
+  mode = DEFAULT_MODE,
 ): string {
+  const policy = getModePolicy(mode);
   return [
     "Sandbox Configuration",
-    `  Project config: ${paths.projectPath}`,
-    `  Global config:  ${paths.globalPath}`,
+    `  Active mode: ${mode}`,
+    "  Mode policy:",
+    `    Read:    ${policy.read}`,
+    `    Write:   ${policy.write}`,
+    `    Network: ${policy.network}`,
+    "",
+    "Config files:",
+    `  Global base:  ${paths.globalBasePath}`,
+    `  Global mode:  ${paths.globalModePath ?? "(none)"}`,
+    `  Project base: ${paths.projectBasePath}`,
+    `  Project mode: ${paths.projectModePath ?? "(none)"}`,
     "",
     "Network (bash + !cmd):",
     `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
@@ -187,7 +204,6 @@ export function formatSandboxConfiguration(
       : []),
     "",
     "Note: ALL reads are prompted unless the path is already in allowRead.",
-    "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
-    "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+    "Note: denyRead and denyWrite take PRECEDENCE over allow lists and are never prompted.",
   ].join("\n");
 }

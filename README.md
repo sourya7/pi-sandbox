@@ -60,9 +60,9 @@ pi install npm:pi-sandbox
 
 #### Configure
 Add a config like this either to `~/.pi/agent/sandbox.json` (global) or to `.pi/sandbox.json` (local).
-Local config takes precedence over global.
+Global config acts as a baseline and local config extends it. Known sandbox arrays (`allowedDomains`, `deniedDomains`, `allowRead`, `denyRead`, `allowWrite`, `denyWrite`) are merged additively with de-duplication; scalar/object fields still use normal override semantics.
 
-Note below that the order of precedence for filesystem read and write are opposite.
+Deny rules always take precedence over allow rules.
 
 ```json
 {
@@ -76,8 +76,7 @@ Note below that the order of precedence for filesystem read and write are opposi
   "filesystem": {
     // For READS:
     // - ANY read is prompted unless the path is already in allowRead
-    // - Granting a prompt adds to allowRead, which overrides denyRead
-    // - denyRead is not a hard-block; it just marks regions as denied by default
+    // - DENY takes precedence and is never prompted
     "denyRead": ["/Users", "/home"],
     "allowRead": [".", "~/.config", "~/.local", "Library"],
 
@@ -93,8 +92,13 @@ Note below that the order of precedence for filesystem read and write are opposi
 #### Usage
 
 ```
-pi --no-sandbox          disable sandboxing for the session
-/sandbox                 show current configuration and session allowances
+pi --no-sandbox                    disable sandboxing for the session
+pi --sandbox-mode read-only         start in a named sandbox mode
+/sandbox                           show current configuration and session allowances
+/sandbox-mode                      show active sandbox mode
+/sandbox-mode read-only            switch to read-only mode
+/sandbox-mode build                switch to build mode
+/sandbox-mode default              switch to default mode
 ```
 
 ## What it does
@@ -111,12 +115,42 @@ When a block is triggered, a prompt appears with four options:
 
 - Abort (keep blocked)
 - Allow for this session only
-- Allow for this project — written to `.pi/sandbox.json`
-- Allow for all projects — written to `~/.pi/agent/sandbox.json`
+- Allow for this project — written to `.pi/sandbox.json` or `.pi/sandbox.<mode>.json`
+- Allow for all projects — written to `~/.pi/agent/sandbox.json` or `~/.pi/agent/sandbox.<mode>.json`
 
 **Session allowances** are held in memory only. They are never written to disk
-and the agent has no way to read or modify them. They are reset when the
-extension reloads or pi restarts.
+and the agent has no way to read or modify them. They are mode-local, so a grant
+in `build` does not leak into `read-only`. They are reset when the extension
+reloads or pi restarts.
+
+### Sandbox modes
+
+The active mode selects additional mode-specific config files and a mode policy:
+
+| Mode | Read | Write | Network |
+|------|------|-------|---------|
+| `default` | Prompt unknown reads | Prompt unknown writes | Prompt unknown domains |
+| `read-only` | Prompt unknown reads | Deny writes without prompting | Prompt unknown domains |
+| `build` | Prompt unknown reads | Prompt unknown writes | Prompt unknown domains |
+
+Config merge order for `default`:
+
+```text
+DEFAULT_CONFIG -> ~/.pi/agent/sandbox.json -> <project>/.pi/sandbox.json -> session allowances
+```
+
+Config merge order for named modes such as `read-only` or `build`:
+
+```text
+DEFAULT_CONFIG
+-> ~/.pi/agent/sandbox.json
+-> ~/.pi/agent/sandbox.<mode>.json
+-> <project>/.pi/sandbox.json
+-> <project>/.pi/sandbox.<mode>.json
+-> session allowances for that mode
+```
+
+Read-only mode prevents the model from writing through write/edit/bash and disables write escalation prompts. It still permits network research according to `network.allowedDomains` and prompts for unknown domains. Trusted extensions may perform their own internal writes, such as pi-web-access cloning GitHub repos to `/tmp/pi-github-repos`; this is outside the direct model tool surface and should be configured separately if needed.
 
 ### What is prompted vs. hard-blocked
 
@@ -125,6 +159,7 @@ extension reloads or pi restarts.
 | Domain not in `allowedDomains` | Prompted (bash and `!cmd`) |
 | Path not in `allowRead` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
+| Path in `denyRead` | Hard-blocked, no prompt |
 | Path in `denyWrite` | Hard-blocked, no prompt |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
 
@@ -137,14 +172,8 @@ allow all domains; pi-sandbox shows a warning when this is configured because it
 removes per-domain prompts and can be easy to add accidentally. `allowWrite` uses prefix
 matching, so `.` covers the entire current working directory.
 
-> **⚠️ Read and write have different precedence rules:**
->
-> - **Read:** Every read is prompted unless the path is already in `allowRead`.
->   `denyRead` is not a hard-block — it marks regions as denied by default, but
->   granting a prompt adds the path to `allowRead`, overriding `denyRead`.
-> - **Write:** `denyWrite` takes precedence over `allowWrite` and is never
->   prompted. A path in `denyWrite` is always blocked, even if it matches
->   `allowWrite`.
+> **⚠️ Deny rules always win:** `denyRead` and `denyWrite` take precedence over
+> matching allow rules and are never prompted.
 
 If neither file exists, built-in defaults apply (see above for the defaults).
 
