@@ -34,11 +34,28 @@ const PERMISSION_OPTIONS: PromptOption[] = [
   },
 ];
 
+function permissionOptionLabel(option: PromptOption): string {
+  return option.hint ? `${option.label}  ${option.hint}` : option.label;
+}
+
+async function showRpcPermissionPrompt(
+  ctx: ExtensionContext,
+  title: string,
+): Promise<PermissionChoice> {
+  const labels = PERMISSION_OPTIONS.map(permissionOptionLabel);
+  const selected = await ctx.ui.select(title, labels);
+  const selectedIndex = selected ? labels.indexOf(selected) : -1;
+
+  return selectedIndex >= 0 ? PERMISSION_OPTIONS[selectedIndex].action : "abort";
+}
+
 export async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return "abort";
+
+  if (ctx.mode === "rpc") return showRpcPermissionPrompt(ctx, title);
 
   const result = await ctx.ui.custom<PermissionChoice>((tui, theme, _kb, done) => {
     let selectedIndex = 0;

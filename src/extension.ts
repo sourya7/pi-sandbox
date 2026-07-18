@@ -153,7 +153,7 @@ export default function (pi: ExtensionAPI) {
       try {
         result = await runBash();
       } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes("Operation not permitted")) {
+        if (!(error instanceof Error) || !extractBlockedWritePath(error.message)) {
           throw error;
         }
         result = {

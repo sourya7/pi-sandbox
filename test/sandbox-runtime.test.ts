@@ -21,10 +21,25 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
 });
 
+test("extractBlockedWritePath recognizes sandbox violation annotations", () => {
+  assert.equal(
+    extractBlockedWritePath(
+      "bash failed\n<sandbox_violations>\ndeny openat /home/mojo/test.txt\n</sandbox_violations>",
+    ),
+    "/home/mojo/test.txt",
+  );
+});
+
 test("extractBlockedWritePath recognizes shell sandbox errors", () => {
   assert.equal(
     extractBlockedWritePath("bash: line 1: /private/file: Operation not permitted"),
     "/private/file",
+  );
+  assert.equal(
+    extractBlockedWritePath(
+      "/run/current-system/sw/bin/bash: line 4: /home/mojo/test.txt: Read-only file system",
+    ),
+    "/home/mojo/test.txt",
   );
   assert.equal(extractBlockedWritePath("permission denied"), null);
 });

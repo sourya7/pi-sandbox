@@ -53,6 +53,7 @@ export async function initializeSandbox(
   await SandboxManager.initialize(
     runtimeConfig,
     createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? []),
+    true,
   );
 }
 
@@ -70,10 +71,15 @@ export function supportsNodeEnvProxy(version: string): boolean {
 }
 
 export function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d: )?(\/[^\s:]+): Operation not permitted/,
+  const violationMatch = output.match(
+    /<sandbox_violations>\s*[\s\S]*?^deny\s+\S+\s+(.+?)\s*$[\s\S]*?<\/sandbox_violations>/m,
   );
-  return match ? match[1] : null;
+  if (violationMatch) return violationMatch[1];
+
+  const shellErrorMatch = output.match(
+    /(?:^|\n)(?:(?:[^\n:]*\/)?(?:ba|z|fi)?sh): (?:line \d+: )?(.+?): (?:Operation not permitted|Read-only file system|Permission denied)(?:\n|$)/,
+  );
+  return shellErrorMatch ? shellErrorMatch[1] : null;
 }
 
 export function createSandboxedBashOps(shellPath?: string): BashOperations {
@@ -111,8 +117,13 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
           }, timeout * 1000);
         }
 
+        let stderr = "";
+
         child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
+        child.stderr?.on("data", (data: Buffer) => {
+          stderr += data.toString("utf8");
+          onData(data);
+        });
         child.on("error", (error) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           reject(error);
@@ -122,6 +133,12 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
         child.on("close", (code) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           signal?.removeEventListener("abort", killProcessGroup);
+
+          const annotatedStderr = SandboxManager.annotateStderrWithSandboxFailures(command, stderr);
+          if (annotatedStderr !== stderr) {
+            onData(Buffer.from(annotatedStderr.slice(stderr.length), "utf8"));
+          }
+
           SandboxManager.cleanupAfterCommand();
 
           if (signal?.aborted) reject(new Error("aborted"));
