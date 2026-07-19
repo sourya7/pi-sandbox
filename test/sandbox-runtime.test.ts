@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import assert from "node:assert/strict";
@@ -6,6 +9,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   buildRuntimeConfig,
   extractBlockedWritePath,
+  filterDenyWriteForRuntime,
   supportsNodeEnvProxy,
 } from "../src/sandbox-runtime.ts";
 
@@ -19,6 +23,37 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.equal(runtime.filesystem?.allowRead?.includes("/read"), true);
   assert.equal(runtime.filesystem?.allowWrite?.includes("/write"), true);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
+});
+
+test("buildRuntimeConfig filters non-existent denyWrite leaves under unwritable parents", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
+  chmodSync(cwd, 0o555);
+  try {
+    const runtime = buildRuntimeConfig(
+      { ...DEFAULT_CONFIG, filesystem: { ...DEFAULT_CONFIG.filesystem, denyWrite: [".env"] } },
+      undefined,
+      cwd,
+    );
+    assert.deepEqual(runtime.filesystem?.denyWrite, []);
+  } finally {
+    chmodSync(cwd, 0o755);
+  }
+});
+
+test("filterDenyWriteForRuntime keeps non-existent denyWrite leaves under writable parents", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
+  assert.deepEqual(filterDenyWriteForRuntime([".env"], cwd), [".env"]);
+});
+
+test("filterDenyWriteForRuntime keeps glob patterns", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
+  assert.deepEqual(filterDenyWriteForRuntime([".env.*", "*.pem"], cwd), [".env.*", "*.pem"]);
+});
+
+test("filterDenyWriteForRuntime keeps existing denyWrite paths", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
+  mkdirSync(join(cwd, ".env"));
+  assert.deepEqual(filterDenyWriteForRuntime([".env"], cwd), [".env"]);
 });
 
 test("extractBlockedWritePath recognizes sandbox violation annotations", () => {

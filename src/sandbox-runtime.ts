@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { constants, existsSync, accessSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   SandboxManager,
@@ -21,10 +23,46 @@ export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCa
   return async ({ host }) => domainIsAllowed(host, allowedDomains);
 }
 
+function resolveConfigPath(pattern: string, cwd: string): string {
+  if (pattern.startsWith("~")) return resolve(pattern.replace(/^~(?=$|\/)/, homedir()));
+  if (isAbsolute(pattern)) return resolve(pattern);
+  return resolve(join(cwd, pattern));
+}
+
+function deepestExistingAncestor(path: string): string | null {
+  let current = dirname(path);
+  while (current && current !== dirname(current)) {
+    if (existsSync(current)) return current;
+    current = dirname(current);
+  }
+  return existsSync(current) ? current : null;
+}
+
+function isWritable(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function filterDenyWriteForRuntime(denyWrite: string[], cwd: string): string[] {
+  return denyWrite.filter((pattern) => {
+    if (pattern.includes("*")) return true;
+    const resolved = resolveConfigPath(pattern, cwd);
+    if (existsSync(resolved)) return true;
+    const ancestor = deepestExistingAncestor(resolved);
+    return !ancestor || isWritable(ancestor);
+  });
+}
+
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  cwd?: string,
 ): SandboxRuntimeConfig {
+  const denyWrite = config.filesystem?.denyWrite ?? [];
   return {
     network: {
       ...config.network,
@@ -36,7 +74,7 @@ export function buildRuntimeConfig(
       denyRead: config.filesystem?.denyRead ?? [],
       allowRead: [...(config.filesystem?.allowRead ?? []), ...(allowances?.readPaths ?? [])],
       allowWrite: [...(config.filesystem?.allowWrite ?? []), ...(allowances?.writePaths ?? [])],
-      denyWrite: config.filesystem?.denyWrite ?? [],
+      denyWrite: cwd ? filterDenyWriteForRuntime(denyWrite, cwd) : denyWrite,
     },
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
@@ -47,8 +85,9 @@ export function buildRuntimeConfig(
 export async function initializeSandbox(
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  cwd?: string,
 ): Promise<void> {
-  const runtimeConfig = buildRuntimeConfig(config, allowances);
+  const runtimeConfig = buildRuntimeConfig(config, allowances, cwd);
   await SandboxManager.initialize(
     runtimeConfig,
     createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? []),
@@ -59,9 +98,10 @@ export async function initializeSandbox(
 export async function reinitializeSandbox(
   config: SandboxConfig,
   allowances: SessionAllowances,
+  cwd?: string,
 ): Promise<void> {
   await SandboxManager.reset();
-  await initializeSandbox(config, allowances);
+  await initializeSandbox(config, allowances, cwd);
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {

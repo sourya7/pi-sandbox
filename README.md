@@ -77,8 +77,8 @@ Deny rules always take precedence over allow rules.
     // For READS:
     // - ANY read is prompted unless the path is already in allowRead
     // - DENY takes precedence and is never prompted
-    "denyRead": ["/Users", "/home"],
-    "allowRead": [".", "~/.config", "~/.local", "Library"],
+    "denyRead": [],
+    "allowRead": ["."],
 
     // For WRITES:
     // - empty ALLOW means no write access at all
@@ -166,6 +166,12 @@ Read-only mode prevents the model from writing through write/edit/bash and disab
 If a path is added to `allowWrite` via a prompt but is also present in
 `denyWrite`, it remains blocked. A warning is shown explaining which config
 files to check.
+
+On Linux, non-existent exact `denyWrite` paths under an unwritable parent are
+omitted from the OS-level mount plan. They cannot be created by the sandboxed
+process anyway, and omitting them avoids low-level `bwrap` startup failures.
+Existing denied paths and glob deny patterns are still passed through for
+normal enforcement.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it

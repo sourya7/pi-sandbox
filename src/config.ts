@@ -33,8 +33,8 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     deniedDomains: [],
   },
   filesystem: {
-    denyRead: ["/Users", "/home"],
-    allowRead: [".", "~/.config", "~/.local", "Library"],
+    denyRead: [],
+    allowRead: ["."],
     allowWrite: [".", "/tmp"],
     denyWrite: [".env", ".env.*", "*.pem", "*.key"],
   },

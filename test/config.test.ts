@@ -31,6 +31,10 @@ test("deepMerge merges sections while adding configured arrays", () => {
   assert.equal(merged.filesystem?.denyWrite?.includes("*.secret"), true);
 });
 
+test("built-in defaults do not hard-deny normal home directory projects", () => {
+  assert.deepEqual(DEFAULT_CONFIG.filesystem?.denyRead, []);
+});
+
 test("a later merge adds to global configuration without erasing it", () => {
   const global = deepMerge(DEFAULT_CONFIG, {
     filesystem: {

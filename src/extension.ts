@@ -117,7 +117,11 @@ export default function (pi: ExtensionAPI) {
   async function refreshSandbox(cwd: string): Promise<void> {
     if (!sandboxInitialized) return;
     try {
-      await reinitializeSandbox(runtimeConfigForActiveMode(cwd), runtimeAllowancesForActiveMode());
+      await reinitializeSandbox(
+        runtimeConfigForActiveMode(cwd),
+        runtimeAllowancesForActiveMode(),
+        cwd,
+      );
     } catch (error) {
       console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
     }
@@ -169,7 +173,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      await initializeSandbox(runtimeConfig, runtimeAllowancesForActiveMode());
+      await initializeSandbox(runtimeConfig, runtimeAllowancesForActiveMode(), ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
