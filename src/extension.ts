@@ -74,6 +74,8 @@ export default function (pi: ExtensionAPI) {
   const allowancesByMode = new Map<string, SessionAllowances>();
   const pendingDomainPrompts = new Map<string, Promise<boolean>>();
   let activeCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
+  let activeToolCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
+  let activeToolRunId = 0;
 
   function getModeAllowances(mode = activeMode): SessionAllowances {
     let allowances = allowancesByMode.get(mode);
@@ -166,12 +168,18 @@ export default function (pi: ExtensionAPI) {
     const prompt = (async () => {
       const policy = getModePolicy(activeMode);
       if (policy.network === "deny") return false;
-      if (!activeCtx) return false;
-      const choice = await promptDomainBlock(activeCtx, host);
+      const ctxToUse = activeToolCtx ?? activeCtx;
+      if (!ctxToUse) return false;
+      const promptCwd = ctxToUse.cwd ?? cwd;
+      const choice = await promptDomainBlock(ctxToUse, host);
       if (choice === "abort") return false;
-      await applyChoice(choice, "domain", host, cwd, false);
+      await applyChoice(choice, "domain", host, promptCwd, false);
       SandboxManager.updateConfig(
-        buildRuntimeConfig(runtimeConfigForActiveMode(cwd), runtimeAllowancesForActiveMode(), cwd),
+        buildRuntimeConfig(
+          runtimeConfigForActiveMode(promptCwd),
+          runtimeAllowancesForActiveMode(),
+          promptCwd,
+        ),
       );
       return true;
     })().finally(() => pendingDomainPrompts.delete(host));
@@ -226,14 +234,20 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate, ctx);
+      const runBash = async () => {
+        const runId = ++activeToolRunId;
+        activeToolCtx = ctx;
+        try {
+          if (!sandboxEnabled || !sandboxInitialized) {
+            return await localBash.execute(id, params, signal, onUpdate, ctx);
+          }
+          return await createBashToolDefinition(localCwd, {
+            operations: createSandboxedBashOps(userShellPath),
+            shellPath: userShellPath,
+          }).execute(id, params, signal, onUpdate, ctx);
+        } finally {
+          if (activeToolRunId === runId) activeToolCtx = undefined;
         }
-        return createBashToolDefinition(localCwd, {
-          operations: createSandboxedBashOps(userShellPath),
-          shellPath: userShellPath,
-        }).execute(id, params, signal, onUpdate, ctx);
       };
 
       let result: AgentToolResult<any>;
