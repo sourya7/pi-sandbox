@@ -19,8 +19,14 @@ export interface SessionAllowances {
   writePaths: string[];
 }
 
-export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
-  return async ({ host }) => domainIsAllowed(host, allowedDomains);
+export function createNetworkAskCallback(
+  allowedDomains: string[],
+  onBlockedDomain?: (host: string) => Promise<boolean>,
+): SandboxAskCallback {
+  return async ({ host }) => {
+    if (domainIsAllowed(host, allowedDomains)) return true;
+    return onBlockedDomain ? onBlockedDomain(host) : false;
+  };
 }
 
 function resolveConfigPath(pattern: string, cwd: string): string {
@@ -86,11 +92,12 @@ export async function initializeSandbox(
   config: SandboxConfig,
   allowances?: SessionAllowances,
   cwd?: string,
+  onBlockedDomain?: (host: string) => Promise<boolean>,
 ): Promise<void> {
   const runtimeConfig = buildRuntimeConfig(config, allowances, cwd);
   await SandboxManager.initialize(
     runtimeConfig,
-    createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? []),
+    createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? [], onBlockedDomain),
     true,
   );
 }
@@ -99,9 +106,10 @@ export async function reinitializeSandbox(
   config: SandboxConfig,
   allowances: SessionAllowances,
   cwd?: string,
+  onBlockedDomain?: (host: string) => Promise<boolean>,
 ): Promise<void> {
   await SandboxManager.reset();
-  await initializeSandbox(config, allowances, cwd);
+  await initializeSandbox(config, allowances, cwd, onBlockedDomain);
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {
@@ -109,16 +117,69 @@ export function supportsNodeEnvProxy(version: string): boolean {
   return (major === 22 && minor >= 21) || major >= 24;
 }
 
-export function extractBlockedWritePath(output: string): string | null {
-  const violationMatch = output.match(
-    /<sandbox_violations>\s*[\s\S]*?^deny\s+\S+\s+(.+?)\s*$[\s\S]*?<\/sandbox_violations>/m,
-  );
-  if (violationMatch) return violationMatch[1];
+export type ParsedSandboxViolation =
+  | { type: "read"; path: string; raw: string }
+  | { type: "write"; path: string; raw: string }
+  | { type: "network"; host?: string; raw: string }
+  | { type: "unknown"; raw: string };
 
+function parseViolationLine(line: string): ParsedSandboxViolation | null {
+  const trimmed = line.trim();
+  const match = trimmed.match(/^deny(?:\(\d+\))?\s+(\S+)\s+(.+?)\s*$/);
+  if (!match) return null;
+
+  const [, op, target] = match;
+  if (op.startsWith("file-read")) return { type: "read", path: target, raw: trimmed };
+  if (op.startsWith("file-write")) return { type: "write", path: target, raw: trimmed };
+  if (op === "network-outbound") {
+    const host =
+      target.match(/"([^"\s:)]+)(?::\d+)?"/)?.[1] ??
+      target.match(/\b(?:host|ip)\s+([^"\s:)]+)/)?.[1];
+    return { type: "network", host, raw: trimmed };
+  }
+
+  // Linux's violation monitor currently reports write-intent syscalls as
+  // `deny <syscall> <path>`, for example `deny openat /tmp/file`.
+  if (target.startsWith("/")) return { type: "write", path: target, raw: trimmed };
+  return { type: "unknown", raw: trimmed };
+}
+
+export function extractSandboxViolation(output: string): ParsedSandboxViolation | null {
+  const blockMatch = output.match(/<sandbox_violations>\s*([\s\S]*?)\s*<\/sandbox_violations>/m);
+  if (blockMatch) {
+    for (const line of blockMatch[1].split(/\r?\n/)) {
+      const parsed = parseViolationLine(line);
+      if (parsed) return parsed;
+    }
+  }
+
+  // Shell redirection/create failures are write failures.
   const shellErrorMatch = output.match(
     /(?:^|\n)(?:(?:[^\n:]*\/)?(?:ba|z|fi)?sh): (?:line \d+: )?(.+?): (?:Operation not permitted|Read-only file system|Permission denied)(?:\n|$)/,
   );
-  return shellErrorMatch ? shellErrorMatch[1] : null;
+  if (shellErrorMatch) {
+    return { type: "write", path: shellErrorMatch[1], raw: shellErrorMatch[0].trim() };
+  }
+
+  // Common read tools report denied file reads as `<tool>: <path>: denied`.
+  const readErrorMatch = output.match(
+    /(?:^|\n)(?:cat|grep|rg|head|tail|less|more|sed|awk): (.+?): (?:Operation not permitted|Permission denied)(?:\n|$)/,
+  );
+  if (readErrorMatch) {
+    return { type: "read", path: readErrorMatch[1], raw: readErrorMatch[0].trim() };
+  }
+
+  return null;
+}
+
+export function extractBlockedReadPath(output: string): string | null {
+  const violation = extractSandboxViolation(output);
+  return violation?.type === "read" ? violation.path : null;
+}
+
+export function extractBlockedWritePath(output: string): string | null {
+  const violation = extractSandboxViolation(output);
+  return violation?.type === "write" ? violation.path : null;
 }
 
 export function createSandboxedBashOps(shellPath?: string): BashOperations {

@@ -54,9 +54,8 @@ export async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
 ): Promise<PermissionChoice> {
-  if (!ctx.hasUI) return "abort";
-
   if (ctx.mode === "rpc") return showRpcPermissionPrompt(ctx, title);
+  if (!ctx.hasUI) return "abort";
 
   const result = await ctx.ui.custom<PermissionChoice>((tui, theme, _kb, done) => {
     let selectedIndex = 0;

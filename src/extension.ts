@@ -22,8 +22,9 @@ import {
   shouldPromptForWrite,
 } from "./policy.ts";
 import {
+  buildRuntimeConfig,
   createSandboxedBashOps,
-  extractBlockedWritePath,
+  extractSandboxViolation,
   initializeSandbox,
   reinitializeSandbox,
   type SessionAllowances,
@@ -71,6 +72,8 @@ export default function (pi: ExtensionAPI) {
   let sandboxInitialized = false;
   let activeMode = DEFAULT_MODE;
   const allowancesByMode = new Map<string, SessionAllowances>();
+  const pendingDomainPrompts = new Map<string, Promise<boolean>>();
+  let activeCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
 
   function getModeAllowances(mode = activeMode): SessionAllowances {
     let allowances = allowancesByMode.get(mode);
@@ -121,6 +124,7 @@ export default function (pi: ExtensionAPI) {
         runtimeConfigForActiveMode(cwd),
         runtimeAllowancesForActiveMode(),
         cwd,
+        (host) => handleRuntimeBlockedDomain(host, cwd),
       );
     } catch (error) {
       console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
@@ -132,6 +136,7 @@ export default function (pi: ExtensionAPI) {
     kind: "domain" | "read" | "write",
     value: string,
     cwd: string,
+    refresh = true,
   ): Promise<void> {
     const paths = getConfigPaths(cwd, activeMode);
     const target =
@@ -150,7 +155,29 @@ export default function (pi: ExtensionAPI) {
       if (!allowances.writePaths.includes(value)) allowances.writePaths.push(value);
       if (choice !== "session") addWritePathToConfig(target, value);
     }
-    await refreshSandbox(cwd);
+    if (refresh) await refreshSandbox(cwd);
+  }
+
+  async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
+    if (domainIsAllowed(host, effectiveDomains(cwd))) return true;
+    const existing = pendingDomainPrompts.get(host);
+    if (existing) return existing;
+
+    const prompt = (async () => {
+      const policy = getModePolicy(activeMode);
+      if (policy.network === "deny") return false;
+      if (!activeCtx) return false;
+      const choice = await promptDomainBlock(activeCtx, host);
+      if (choice === "abort") return false;
+      await applyChoice(choice, "domain", host, cwd, false);
+      SandboxManager.updateConfig(
+        buildRuntimeConfig(runtimeConfigForActiveMode(cwd), runtimeAllowancesForActiveMode(), cwd),
+      );
+      return true;
+    })().finally(() => pendingDomainPrompts.delete(host));
+
+    pendingDomainPrompts.set(host, prompt);
+    return prompt;
   }
 
   function updateStatus(
@@ -164,6 +191,7 @@ export default function (pi: ExtensionAPI) {
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     setProxyEnvironment: boolean,
   ): Promise<boolean> {
+    activeCtx = ctx;
     const config = loadConfig(ctx.cwd, activeMode);
     const runtimeConfig = runtimeConfigForActiveMode(ctx.cwd);
     const platform = process.platform;
@@ -173,7 +201,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      await initializeSandbox(runtimeConfig, runtimeAllowancesForActiveMode(), ctx.cwd);
+      await initializeSandbox(runtimeConfig, runtimeAllowancesForActiveMode(), ctx.cwd, (host) =>
+        handleRuntimeBlockedDomain(host, ctx.cwd),
+      );
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
@@ -210,7 +240,7 @@ export default function (pi: ExtensionAPI) {
       try {
         result = await runBash();
       } catch (error) {
-        if (!(error instanceof Error) || !extractBlockedWritePath(error.message)) {
+        if (!(error instanceof Error) || !extractSandboxViolation(error.message)) {
           throw error;
         }
         result = {
@@ -224,14 +254,47 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
+      if (sandboxEnabled && sandboxInitialized) {
         const output = result.content
           .filter((content: any) => content.type === "text")
           .map((content: any) => content.text)
           .join("\n");
-        const blockedPath = extractBlockedWritePath(output);
+        const violation = extractSandboxViolation(output);
 
-        if (blockedPath) {
+        if (violation?.type === "read") {
+          const policy = getModePolicy(activeMode);
+          if (policy.read === "deny") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Blocked by sandbox mode "${activeMode}": reads are not permitted.\n` +
+                    `Attempted read path: ${violation.path}`,
+                },
+              ],
+              details: {},
+            };
+          }
+
+          const choice = await promptReadBlock(ctx, violation.path);
+          if (choice !== "abort") {
+            await applyChoice(choice, "read", violation.path, ctx.cwd);
+            onUpdate?.({
+              content: [
+                {
+                  type: "text",
+                  text: `\n--- Read access granted for "${violation.path}", retrying ---\n`,
+                },
+              ],
+              details: {},
+            });
+            return runBash();
+          }
+        }
+
+        if (violation?.type === "write") {
+          const blockedPath = violation.path;
           const policy = getModePolicy(activeMode);
           if (policy.write === "deny") {
             return {
@@ -272,6 +335,18 @@ export default function (pi: ExtensionAPI) {
             });
             return runBash();
           }
+        }
+
+        if (violation?.type === "network") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Blocked by sandbox network policy: ${violation.host ?? violation.raw}`,
+              },
+            ],
+            details: {},
+          };
         }
       }
       return result;

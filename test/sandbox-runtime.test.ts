@@ -9,6 +9,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   buildRuntimeConfig,
   extractBlockedWritePath,
+  extractSandboxViolation,
   filterDenyWriteForRuntime,
   supportsNodeEnvProxy,
 } from "../src/sandbox-runtime.ts";
@@ -77,6 +78,31 @@ test("extractBlockedWritePath recognizes shell sandbox errors", () => {
     "/home/mojo/test.txt",
   );
   assert.equal(extractBlockedWritePath("permission denied"), null);
+});
+
+test("extractSandboxViolation classifies read, write, and network annotations", () => {
+  assert.deepEqual(
+    extractSandboxViolation(
+      "<sandbox_violations>\ndeny(1) file-read-data /private/secret\n</sandbox_violations>",
+    ),
+    { type: "read", path: "/private/secret", raw: "deny(1) file-read-data /private/secret" },
+  );
+  assert.deepEqual(
+    extractSandboxViolation(
+      "<sandbox_violations>\ndeny(1) file-write-create /private/out\n</sandbox_violations>",
+    ),
+    { type: "write", path: "/private/out", raw: "deny(1) file-write-create /private/out" },
+  );
+  assert.deepEqual(
+    extractSandboxViolation(
+      '<sandbox_violations>\ndeny(1) network-outbound remote ip "example.com:443"\n</sandbox_violations>',
+    ),
+    {
+      type: "network",
+      host: "example.com",
+      raw: 'deny(1) network-outbound remote ip "example.com:443"',
+    },
+  );
 });
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {
