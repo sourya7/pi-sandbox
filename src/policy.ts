@@ -10,14 +10,6 @@ export function shouldPromptForWrite(
   return allowWrite.length === 0 || !matches(path, allowWrite);
 }
 
-export function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
-  const domains = new Set<string>();
-  let match: RegExpExecArray | null;
-  while ((match = urlRegex.exec(command)) !== null) domains.add(match[1]);
-  return [...domains];
-}
-
 export function domainMatchesPattern(domain: string, pattern: string): boolean {
   if (pattern === "*") return true;
   if (pattern.startsWith("*.")) {

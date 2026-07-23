@@ -9,17 +9,9 @@ import {
   allowsAllDomains,
   canonicalizePath,
   domainIsAllowed,
-  extractDomainsFromCommand,
   matchesPattern,
   shouldPromptForWrite,
 } from "../src/policy.ts";
-
-test("extracts and deduplicates literal HTTP domains", () => {
-  assert.deepEqual(
-    extractDomainsFromCommand("curl https://api.example.com/a http://api.example.com/b"),
-    ["api.example.com"],
-  );
-});
 
 test("matches exact, wildcard, and all-domain policies", () => {
   assert.equal(domainIsAllowed("github.com", ["github.com"]), true);

@@ -17,7 +17,6 @@ import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import {
   canonicalizePath,
   domainIsAllowed,
-  extractDomainsFromCommand,
   matchesPattern,
   shouldPromptForWrite,
 } from "./policy.ts";
@@ -367,36 +366,8 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("user_bash", async (event, ctx) => {
+  pi.on("user_bash", async () => {
     if (!sandboxEnabled || !sandboxInitialized) return;
-
-    for (const domain of extractDomainsFromCommand(event.command)) {
-      if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
-        const policy = getModePolicy(activeMode);
-        if (policy.network === "deny") {
-          return {
-            result: {
-              output: `Sandbox mode "${activeMode}" blocks network access to "${domain}".`,
-              exitCode: 1,
-              cancelled: false,
-              truncated: false,
-            },
-          };
-        }
-        const choice = await promptDomainBlock(ctx, domain);
-        if (choice === "abort") {
-          return {
-            result: {
-              output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.`,
-              exitCode: 1,
-              cancelled: false,
-              truncated: false,
-            },
-          };
-        }
-        await applyChoice(choice, "domain", domain, ctx.cwd);
-      }
-    }
     return { operations: createSandboxedBashOps(userShellPath) };
   });
 
@@ -407,28 +378,6 @@ export default function (pi: ExtensionAPI) {
     const paths = getConfigPaths(ctx.cwd, activeMode);
     const projectPath = paths.projectModePath ?? paths.projectBasePath;
     const globalPath = paths.globalModePath ?? paths.globalBasePath;
-
-    if (sandboxInitialized && isToolCallEventType("bash", event)) {
-      for (const domain of extractDomainsFromCommand(event.input.command)) {
-        if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
-          const policy = getModePolicy(activeMode);
-          if (policy.network === "deny") {
-            return {
-              block: true,
-              reason: `Sandbox mode "${activeMode}" blocks network access to "${domain}".`,
-            };
-          }
-          const choice = await promptDomainBlock(ctx, domain);
-          if (choice === "abort") {
-            return {
-              block: true,
-              reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
-            };
-          }
-          await applyChoice(choice, "domain", domain, ctx.cwd);
-        }
-      }
-    }
 
     if (isToolCallEventType("read", event)) {
       const path = canonicalizePath(event.input.path);
