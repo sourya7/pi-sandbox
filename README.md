@@ -47,6 +47,59 @@ sudo apt install ripgrep bubblewrap socat  # Debian/Ubuntu
 
 If a dependency is missing, agent tools fail closed instead of falling back to unsandboxed bash.
 
+### Build the Linux `apply-seccomp` helper
+
+This step is Linux-only. `apply-seccomp` blocks sandboxed commands from creating Unix-domain sockets, preventing access to host capabilities such as Docker, SSH/GPG agents, browser sockets, and local daemons. It is required when the policy uses:
+
+```json
+"network": {
+  "allowAllUnixSockets": false
+}
+```
+
+Published Sandbox Runtime packages normally contain prebuilt x64/arm64 helpers. This repository consumes the runtime source submodule directly, so generate the helper locally. `npm run runtime:setup` builds the TypeScript runtime but does **not** build this native helper.
+
+The build needs Bun, `gcc`, `strip`, and the libseccomp development/static libraries. Install prerequisites with the appropriate OS package manager, for example:
+
+```bash
+# Debian/Ubuntu
+sudo apt install gcc binutils libseccomp-dev
+
+# Fedora/RHEL (glibc-static is needed by the script's -static link)
+sudo dnf install gcc binutils libseccomp-devel glibc-static
+
+# Arch
+sudo pacman -S gcc binutils libseccomp
+
+# Nix: enter a temporary build environment
+nix shell nixpkgs#bun nixpkgs#gcc nixpkgs#binutils nixpkgs#libseccomp nixpkgs#glibc.static
+```
+
+Ensure `bun` is on `PATH`, then run from the repository root:
+
+```bash
+npm --prefix sandbox-runtime run build:seccomp
+```
+
+The output is architecture-specific:
+
+```text
+sandbox-runtime/vendor/seccomp/x64/apply-seccomp    # Node arch x64
+sandbox-runtime/vendor/seccomp/arm64/apply-seccomp  # Node arch arm64
+```
+
+Verify the current architecture's helper:
+
+```bash
+arch_dir=$(node -p 'process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : "unsupported"')
+test "$arch_dir" != unsupported
+test -x "sandbox-runtime/vendor/seccomp/$arch_dir/apply-seccomp"
+```
+
+After building it, set `network.allowAllUnixSockets` to `false` in the active global and mode policies, then restart Pi. If the helper is missing while socket blocking is enabled, bash may fail with an error naming `vendor/seccomp/<arch>/apply-seccomp`. Keeping `allowAllUnixSockets: true` avoids the native helper but leaves host Unix sockets as a significant escape surface.
+
+macOS does not use `apply-seccomp`; Seatbelt enforces Unix-socket restrictions there.
+
 ## Policy version 2
 
 A simple configuration can live in trusted global configuration at `~/.pi/agent/sandbox.json` or in trusted project configuration at `.pi/sandbox.json`:

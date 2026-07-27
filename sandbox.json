@@ -3,33 +3,50 @@
   "enabled": true,
   "failClosed": true,
   "network": {
+    "allowLocalBinding": true,
+    "allowAllUnixSockets": false,
     "allowedDomains": [
+      "localhost",
+      "127.0.0.1",
+      "html.duckduckgo.com",
+      "github.com",
+      "*.github.com",
+      "raw.githubusercontent.com",
       "npmjs.org",
       "*.npmjs.org",
       "registry.npmjs.org",
       "pypi.org",
-      "*.pypi.org",
-      "github.com",
-      "*.github.com",
-      "raw.githubusercontent.com"
+      "*.pypi.org"
     ],
     "deniedDomains": []
   },
   "filesystem": {
     "readScope": "home",
     "denyRead": [
+      ".env",
+      ".env.local",
+      ".env.development",
+      ".env.production",
+      ".env.test",
       "~/.ssh",
-      "~/.aws"
+      "~/.aws",
+      "~/.kube",
+      "~/.config/gcloud",
+      "~/.pi/agent/auth.json",
+      "~/.pi/agent/sessions",
+      "~/.pi/agent/archive.db"
     ],
     "allowRead": [
       "."
     ],
     "allowWrite": [
       ".",
-      "/tmp"
+      "/tmp",
+      "~/.cache/uv"
     ],
     "denyWrite": [
-      ".env"
+      "~/.pi/agent/settings.json",
+      "~/.pi/agent/trust.json"
     ]
   }
 }
