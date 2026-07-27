@@ -11,7 +11,7 @@ import {
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
-import { domainIsAllowed } from "./policy.ts";
+import { canonicalizePath, domainIsAllowed, resolvePolicyPatterns } from "./policy.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -63,12 +63,81 @@ export function filterDenyWriteForRuntime(denyWrite: string[], cwd: string): str
   });
 }
 
+export function getRuntimeBootstrapReadPaths(cwd: string, strict: boolean): string[] {
+  const candidates = new Set<string>([process.execPath]);
+  const shell = process.env.SHELL;
+  if (shell) candidates.add(shell);
+  if (strict) {
+    const platformPaths =
+      process.platform === "darwin"
+        ? [
+            "/bin",
+            "/usr",
+            "/System",
+            "/Library",
+            "/private",
+            "/dev",
+            "/Applications",
+            "/opt/homebrew",
+            "/opt/local",
+            "/usr/local",
+            "/nix",
+            "/run",
+          ]
+        : ["/bin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys", "/run", "/nix"];
+    for (const path of platformPaths) if (existsSync(path)) candidates.add(path);
+  }
+  return [...candidates].map((path) => canonicalizePath(path, cwd));
+}
+
+function uniquePaths(paths: string[], cwd: string): string[] {
+  return [...new Set(resolvePolicyPatterns(paths, cwd).map((path) => path.replace(/\/\*\*$/, "")))];
+}
+
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
-  cwd?: string,
+  cwd = process.cwd(),
+  protectedWritePaths: string[] = [],
+  additionalBootstrapReadPaths: string[] = [],
 ): SandboxRuntimeConfig {
-  const denyWrite = config.filesystem?.denyWrite ?? [];
+  const filesystem = config.filesystem;
+  const version = config.policyVersion ?? 1;
+  const readScope = filesystem.readScope ?? (version === 2 ? "home" : "open");
+  const writePaths = uniquePaths(
+    [...filesystem.allowWrite, ...(allowances?.writePaths ?? [])],
+    cwd,
+  );
+  const configuredRead = uniquePaths(
+    [...(filesystem.allowRead ?? []), ...(allowances?.readPaths ?? []), ...writePaths],
+    cwd,
+  );
+  const bootstrap = [
+    ...getRuntimeBootstrapReadPaths(cwd, readScope === "strict"),
+    ...uniquePaths(additionalBootstrapReadPaths, cwd),
+  ];
+  const scopeDeny =
+    version === 2
+      ? readScope === "strict"
+        ? ["/"]
+        : readScope === "home"
+          ? [homedir()]
+          : []
+      : uniquePaths(filesystem.denyRead, cwd);
+  const credentialHardRead = uniquePaths(
+    (config.credentials?.files ?? [])
+      .filter((entry) => entry.mode === "deny")
+      .map((entry) => entry.path),
+    cwd,
+  );
+  const hardRead =
+    version === 2
+      ? uniquePaths([...filesystem.denyRead, ...credentialHardRead], cwd)
+      : credentialHardRead;
+  const denyWrite = uniquePaths(
+    [...filesystem.denyWrite, ...hardRead, ...protectedWritePaths],
+    cwd,
+  );
   return {
     network: {
       ...config.network,
@@ -76,15 +145,27 @@ export function buildRuntimeConfig(
       deniedDomains: config.network?.deniedDomains ?? [],
     },
     filesystem: {
-      ...config.filesystem,
-      denyRead: config.filesystem?.denyRead ?? [],
-      allowRead: [...(config.filesystem?.allowRead ?? []), ...(allowances?.readPaths ?? [])],
-      allowWrite: [...(config.filesystem?.allowWrite ?? []), ...(allowances?.writePaths ?? [])],
-      denyWrite: cwd ? filterDenyWriteForRuntime(denyWrite, cwd) : denyWrite,
+      disabled: filesystem.disabled,
+      allowGitConfig: filesystem.allowGitConfig,
+      denyRead: scopeDeny,
+      allowRead: [...new Set([...configuredRead, ...bootstrap])],
+      denyReadAlways: hardRead,
+      allowWrite: writePaths,
+      denyWrite: filterDenyWriteForRuntime(denyWrite, cwd),
     },
+    credentials: config.credentials,
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
-    enableWeakerNetworkIsolation: true,
+    enableWeakerNetworkIsolation: config.enableWeakerNetworkIsolation ?? false,
+    allowPty: config.allowPty,
+    allowAppleEvents: config.allowAppleEvents,
+    ripgrep: config.ripgrep,
+    mandatoryDenySearchDepth: config.mandatoryDenySearchDepth,
+    seccomp: config.seccomp,
+    bwrapPath: config.bwrapPath,
+    socatPath: config.socatPath,
+    windows: config.windows,
+    git: config.git,
   };
 }
 
@@ -93,8 +174,16 @@ export async function initializeSandbox(
   allowances?: SessionAllowances,
   cwd?: string,
   onBlockedDomain?: (host: string) => Promise<boolean>,
+  protectedWritePaths: string[] = [],
+  additionalBootstrapReadPaths: string[] = [],
 ): Promise<void> {
-  const runtimeConfig = buildRuntimeConfig(config, allowances, cwd);
+  const runtimeConfig = buildRuntimeConfig(
+    config,
+    allowances,
+    cwd,
+    protectedWritePaths,
+    additionalBootstrapReadPaths,
+  );
   await SandboxManager.initialize(
     runtimeConfig,
     createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? [], onBlockedDomain),
@@ -107,9 +196,18 @@ export async function reinitializeSandbox(
   allowances: SessionAllowances,
   cwd?: string,
   onBlockedDomain?: (host: string) => Promise<boolean>,
+  protectedWritePaths: string[] = [],
+  additionalBootstrapReadPaths: string[] = [],
 ): Promise<void> {
   await SandboxManager.reset();
-  await initializeSandbox(config, allowances, cwd, onBlockedDomain);
+  await initializeSandbox(
+    config,
+    allowances,
+    cwd,
+    onBlockedDomain,
+    protectedWritePaths,
+    additionalBootstrapReadPaths,
+  );
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {

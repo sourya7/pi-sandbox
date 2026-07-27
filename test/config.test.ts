@@ -1,11 +1,19 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
 import assert from "node:assert/strict";
 
-import { deepMerge, DEFAULT_CONFIG, getConfigPaths, loadConfig } from "../src/config.ts";
+import {
+  addReadPathToConfig,
+  deepMerge,
+  DEFAULT_CONFIG,
+  getConfigPaths,
+  loadConfig,
+  loadPolicy,
+  validateConfig,
+} from "../src/config.ts";
 
 test("deepMerge merges sections while adding configured arrays", () => {
   const merged = deepMerge(DEFAULT_CONFIG, {
@@ -72,12 +80,15 @@ test("deepMerge deduplicates additive arrays", () => {
 
 test("getConfigPaths includes mode-specific files for named modes", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
-  assert.deepEqual(getConfigPaths(cwd, "read-only"), {
+  const paths = getConfigPaths(cwd, "read-only");
+  assert.deepEqual(paths, {
     globalBasePath: getConfigPaths(cwd).globalBasePath,
     globalModePath: join(dirname(getConfigPaths(cwd).globalBasePath), "sandbox.read-only.json"),
     projectBasePath: join(cwd, ".pi", "sandbox.json"),
     projectModePath: join(cwd, ".pi", "sandbox.read-only.json"),
+    projectGrantPath: paths.projectGrantPath,
   });
+  assert.match(paths.projectGrantPath, /sandbox-projects\/.+\.read-only\.json$/);
 });
 
 test("loadConfig named mode adds project base and project mode arrays", () => {
@@ -85,17 +96,71 @@ test("loadConfig named mode adds project base and project mode arrays", () => {
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
     join(cwd, ".pi", "sandbox.json"),
-    JSON.stringify({ filesystem: { allowRead: ["/project-base"], denyWrite: ["base.key"] } }),
+    JSON.stringify({ filesystem: { allowRead: ["project-base"], denyWrite: ["base.key"] } }),
   );
   writeFileSync(
     join(cwd, ".pi", "sandbox.read-only.json"),
-    JSON.stringify({ filesystem: { allowRead: ["/project-mode"], denyWrite: ["mode.key"] } }),
+    JSON.stringify({ filesystem: { allowRead: ["project-mode"], denyWrite: ["mode.key"] } }),
   );
 
   const config = loadConfig(cwd, "read-only");
   assert.equal(config.filesystem?.allowRead?.includes("."), true);
-  assert.equal(config.filesystem?.allowRead?.includes("/project-base"), true);
-  assert.equal(config.filesystem?.allowRead?.includes("/project-mode"), true);
+  assert.equal(config.filesystem?.allowRead?.includes("project-base"), true);
+  assert.equal(config.filesystem?.allowRead?.includes("project-mode"), true);
   assert.equal(config.filesystem?.denyWrite?.includes("base.key"), true);
   assert.equal(config.filesystem?.denyWrite?.includes("mode.key"), true);
+});
+
+test("untrusted project policy is not loaded", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-untrusted-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "sandbox.json"),
+    JSON.stringify({
+      filesystem: { denyRead: ["private-marker"], allowRead: [], allowWrite: [], denyWrite: [] },
+    }),
+  );
+  const loaded = loadPolicy(cwd, "default", false);
+  assert.equal(loaded.config.filesystem.denyRead.includes("private-marker"), false);
+  assert.equal(loaded.projectTrusted, false);
+});
+
+test("trusted project cannot grant paths outside the project or disable sandbox", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-project-trust-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "sandbox.json"),
+    JSON.stringify({
+      enabled: false,
+      filesystem: { allowRead: ["/etc"], allowWrite: ["/tmp/out"], denyRead: [], denyWrite: [] },
+    }),
+  );
+  const loaded = loadPolicy(cwd, "default", true);
+  assert.notEqual(loaded.config.enabled, false);
+  assert.equal(loaded.config.filesystem.allowRead?.includes("/etc"), false);
+  assert.equal(loaded.config.filesystem.allowWrite.includes("/tmp/out"), false);
+  assert.equal(loaded.warnings.length >= 2, true);
+});
+
+test("trusted grant writer refuses symlinked policy files", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-policy-write-"));
+  const real = join(cwd, "real.json");
+  const link = join(cwd, "sandbox.json");
+  writeFileSync(real, "{}");
+  symlinkSync(real, link);
+  assert.throws(() => addReadPathToConfig(link, "/allowed"), /symlinked sandbox policy/);
+});
+
+test("policy version 2 rejects non-portable filesystem globs", () => {
+  assert.throws(
+    () =>
+      validateConfig(
+        {
+          policyVersion: 2,
+          filesystem: { denyRead: ["**/.env"], allowRead: [], allowWrite: [], denyWrite: [] },
+        },
+        "test policy",
+      ),
+    /not portable/,
+  );
 });

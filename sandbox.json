@@ -1,50 +1,35 @@
 {
+  "policyVersion": 2,
   "enabled": true,
+  "failClosed": true,
   "network": {
-    "allowLocalBinding": true,
-    "allowAllUnixSockets": true,
     "allowedDomains": [
-      "localhost",
-      "127.0.0.1",
-      "html.duckduckgo.com",
+      "npmjs.org",
       "*.npmjs.org",
+      "registry.npmjs.org",
+      "pypi.org",
       "*.pypi.org",
+      "github.com",
       "*.github.com",
-      "raw.githubusercontent.com",
-      "mcp.context7.com"
+      "raw.githubusercontent.com"
     ],
     "deniedDomains": []
   },
   "filesystem": {
+    "readScope": "home",
     "denyRead": [
-      "/Users"
+      "~/.ssh",
+      "~/.aws"
     ],
     "allowRead": [
-      ".",
-      "~/projects",
-      "~/.config",
-      "~/.cargo",
-      "~/.local",
-      "~/Library",
-      "~/.cache",
-      "/Applications/Google Chrome.app",
-      "/System/Volumes/Data/Applications/Google Chrome.app"
+      "."
     ],
     "allowWrite": [
       ".",
-      "/tmp",
-      "~/.pi/",
-      "~/.cache/uv",
-      "~/.rustup",
-      "~/.agent-browser",
-      "~/Library/Application Support/Google/Chrome",
-      "~/Library/Application Support/Google/Chrome for Testing/Crashpad"
+      "/tmp"
     ],
     "denyWrite": [
-      ".env",
-      ".env.*",
-      "*.pem",
-      "*.key"
+      ".env"
     ]
   }
 }

@@ -5,27 +5,30 @@ import {
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
-  getConfigPaths,
-  loadConfig,
+  loadPolicy,
+  type LoadedSandboxPolicy,
 } from "./config.ts";
 import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import {
   canonicalizePath,
   domainIsAllowed,
+  evaluateReadPolicy,
+  hardDeniesWithin,
   matchesPattern,
-  shouldPromptForWrite,
+  resolvePolicyPatterns,
 } from "./policy.ts";
 import {
   buildRuntimeConfig,
   createSandboxedBashOps,
   extractSandboxViolation,
+  getRuntimeBootstrapReadPaths,
   initializeSandbox,
-  reinitializeSandbox,
   type SessionAllowances,
   supportsNodeEnvProxy,
 } from "./sandbox-runtime.ts";
@@ -33,6 +36,7 @@ import {
   formatSandboxConfiguration,
   formatSandboxStatus,
   type PermissionChoice,
+  promptAccessRequest,
   promptDomainBlock,
   promptReadBlock,
   promptWriteBlock,
@@ -50,13 +54,19 @@ function commandArgText(args: unknown): string {
   return "";
 }
 
+function textResult(text: string): AgentToolResult<Record<string, never>> {
+  return { content: [{ type: "text", text }], details: {} };
+}
+
+type SandboxState = "disabled-by-user" | "initializing" | "active" | "failed";
+type GrantKind = "domain" | "read" | "write";
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
     default: false,
   });
-
   pi.registerFlag("sandbox-mode", {
     description: "Sandbox mode to use, e.g. default, read-only, build",
     type: "string",
@@ -65,16 +75,36 @@ export default function (pi: ExtensionAPI) {
 
   const localCwd = process.cwd();
   const userShellPath = SettingsManager.create(localCwd).getShellPath();
+  const bootstrapShellPaths = userShellPath ? [userShellPath] : [];
   const localBash = createBashToolDefinition(localCwd, { shellPath: userShellPath });
 
-  let sandboxEnabled = false;
-  let sandboxInitialized = false;
+  let state: SandboxState = "initializing";
   let activeMode = DEFAULT_MODE;
+  let policy: LoadedSandboxPolicy | undefined;
   const allowancesByMode = new Map<string, SessionAllowances>();
   const pendingDomainPrompts = new Map<string, Promise<boolean>>();
   let activeCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
   let activeToolCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
-  let activeToolRunId = 0;
+  let mutationTail: Promise<void> = Promise.resolve();
+  let bashTail: Promise<void> = Promise.resolve();
+
+  function serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const run = mutationTail.then(operation, operation);
+    mutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  function serializeBash<T>(operation: () => Promise<T>): Promise<T> {
+    const run = bashTail.then(operation, operation);
+    bashTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
 
   function getModeAllowances(mode = activeMode): SessionAllowances {
     let allowances = allowancesByMode.get(mode);
@@ -85,416 +115,495 @@ export default function (pi: ExtensionAPI) {
     return allowances;
   }
 
-  const effectiveDomains = (cwd: string) => [
-    ...(loadConfig(cwd, activeMode).network?.allowedDomains ?? []),
-    ...getModeAllowances().domains,
-  ];
-  const effectiveReadPaths = (cwd: string) => [
-    ...(loadConfig(cwd, activeMode).filesystem?.allowRead ?? []),
-    ...getModeAllowances().readPaths,
-  ];
-  const effectiveWritePaths = (cwd: string) => [
-    ...(getModePolicy(activeMode).write === "deny"
-      ? []
-      : (loadConfig(cwd, activeMode).filesystem?.allowWrite ?? [])),
-    ...(getModePolicy(activeMode).write === "deny" ? [] : getModeAllowances().writePaths),
-  ];
+  function requirePolicy(): LoadedSandboxPolicy {
+    if (!policy) throw new Error("Sandbox policy is not loaded");
+    return policy;
+  }
 
-  function runtimeConfigForActiveMode(cwd: string): ReturnType<typeof loadConfig> {
-    const config = loadConfig(cwd, activeMode);
-    if (getModePolicy(activeMode).write !== "deny") return config;
+  function loadPolicySnapshot(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+  ): LoadedSandboxPolicy {
+    const loaded = loadPolicy(ctx.cwd, activeMode, ctx.isProjectTrusted());
+    policy = loaded;
+    for (const warning of loaded.warnings) ctx.ui.notify(`Sandbox policy: ${warning}`, "warning");
+    return loaded;
+  }
+
+  function effectiveReadPaths(): string[] {
+    const loaded = requirePolicy();
+    const config = loaded.config;
+    return resolvePolicyPatterns(
+      [
+        ...(config.filesystem.allowRead ?? []),
+        ...config.filesystem.allowWrite,
+        ...getModeAllowances().readPaths,
+        ...getModeAllowances().writePaths,
+      ],
+      activeCtx?.cwd ?? localCwd,
+    );
+  }
+
+  function effectiveWritePaths(): string[] {
+    if (getModePolicy(activeMode).write === "deny") return [];
+    const loaded = requirePolicy();
+    return resolvePolicyPatterns(
+      [...loaded.config.filesystem.allowWrite, ...getModeAllowances().writePaths],
+      activeCtx?.cwd ?? localCwd,
+    );
+  }
+
+  function runtimeConfigForActiveMode() {
+    const loaded = requirePolicy();
+    if (getModePolicy(activeMode).write !== "deny") return loaded.config;
     return {
-      ...config,
-      filesystem: {
-        ...config.filesystem,
-        allowWrite: [],
-      },
+      ...loaded.config,
+      filesystem: { ...loaded.config.filesystem, allowWrite: [] },
     };
   }
 
   function runtimeAllowancesForActiveMode(): SessionAllowances {
     const allowances = getModeAllowances();
-    if (getModePolicy(activeMode).write !== "deny") return allowances;
-    return { ...allowances, writePaths: [] };
+    return getModePolicy(activeMode).write === "deny"
+      ? { ...allowances, writePaths: [] }
+      : allowances;
   }
 
-  async function refreshSandbox(cwd: string): Promise<void> {
-    if (!sandboxInitialized) return;
-    try {
-      await reinitializeSandbox(
-        runtimeConfigForActiveMode(cwd),
-        runtimeAllowancesForActiveMode(),
-        cwd,
-        (host) => handleRuntimeBlockedDomain(host, cwd),
-      );
-    } catch (error) {
-      console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
-    }
+  function updateStatus(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]): void {
+    const loaded = requirePolicy();
+    ctx.ui.setStatus(
+      "sandbox",
+      ctx.ui.theme.fg("accent", formatSandboxStatus(loaded.config, activeMode, state)),
+    );
   }
 
-  async function applyChoice(
-    choice: Exclude<PermissionChoice, "abort">,
-    kind: "domain" | "read" | "write",
-    value: string,
-    cwd: string,
-    refresh = true,
-  ): Promise<void> {
-    const paths = getConfigPaths(cwd, activeMode);
-    const target =
-      choice === "project"
-        ? (paths.projectModePath ?? paths.projectBasePath)
-        : (paths.globalModePath ?? paths.globalBasePath);
-    const allowances = getModeAllowances();
-
-    if (kind === "domain") {
-      if (!allowances.domains.includes(value)) allowances.domains.push(value);
-      if (choice !== "session") addDomainToConfig(target, value);
-    } else if (kind === "read") {
-      if (!allowances.readPaths.includes(value)) allowances.readPaths.push(value);
-      if (choice !== "session") addReadPathToConfig(target, value);
-    } else {
-      if (!allowances.writePaths.includes(value)) allowances.writePaths.push(value);
-      if (choice !== "session") addWritePathToConfig(target, value);
-    }
-    if (refresh) await refreshSandbox(cwd);
-  }
-
-  async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
-    if (domainIsAllowed(host, effectiveDomains(cwd))) return true;
-    const existing = pendingDomainPrompts.get(host);
-    if (existing) return existing;
-
-    const prompt = (async () => {
-      const policy = getModePolicy(activeMode);
-      if (policy.network === "deny") return false;
-      const ctxToUse = activeToolCtx ?? activeCtx;
-      if (!ctxToUse) return false;
-      const promptCwd = ctxToUse.cwd ?? cwd;
-      const choice = await promptDomainBlock(ctxToUse, host);
-      if (choice === "abort") return false;
-      await applyChoice(choice, "domain", host, promptCwd, false);
-      SandboxManager.updateConfig(
-        buildRuntimeConfig(
-          runtimeConfigForActiveMode(promptCwd),
-          runtimeAllowancesForActiveMode(),
-          promptCwd,
-        ),
-      );
-      return true;
-    })().finally(() => pendingDomainPrompts.delete(host));
-
-    pendingDomainPrompts.set(host, prompt);
-    return prompt;
-  }
-
-  function updateStatus(
-    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
-    config: ReturnType<typeof loadConfig>,
-  ) {
-    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(config, activeMode)));
-  }
-
-  async function enableSandbox(
+  async function startSandbox(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     setProxyEnvironment: boolean,
   ): Promise<boolean> {
     activeCtx = ctx;
-    const config = loadConfig(ctx.cwd, activeMode);
-    const runtimeConfig = runtimeConfigForActiveMode(ctx.cwd);
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
-      ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+      state = "failed";
+      ctx.ui.notify(`Sandbox not supported on ${platform}; agent bash is blocked`, "error");
+      updateStatus(ctx);
       return false;
     }
 
+    state = "initializing";
+    updateStatus(ctx);
     try {
-      await initializeSandbox(runtimeConfig, runtimeAllowancesForActiveMode(), ctx.cwd, (host) =>
-        handleRuntimeBlockedDomain(host, ctx.cwd),
+      const loaded = requirePolicy();
+      await initializeSandbox(
+        runtimeConfigForActiveMode(),
+        runtimeAllowancesForActiveMode(),
+        ctx.cwd,
+        (host) => handleRuntimeBlockedDomain(host, ctx.cwd),
+        loaded.protectedWritePaths,
+        bootstrapShellPaths,
       );
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
-      sandboxEnabled = true;
-      sandboxInitialized = true;
-      warnIfAllDomainsAllowed(ctx, config);
-      updateStatus(ctx, config);
+      state = "active";
+      warnIfAllDomainsAllowed(ctx, loaded.config);
+      updateStatus(ctx);
       return true;
     } catch (error) {
-      sandboxEnabled = false;
+      state = "failed";
       ctx.ui.notify(
-        `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
+        `Sandbox initialization failed; agent bash is blocked: ${error instanceof Error ? error.message : error}`,
         "error",
       );
+      updateStatus(ctx);
       return false;
     }
+  }
+
+  async function refreshSandbox(cwd: string): Promise<void> {
+    if (state !== "active") throw new Error(`sandbox is ${state}`);
+    const loaded = requirePolicy();
+    const previousConfig = SandboxManager.getConfig();
+    await SandboxManager.reset();
+    try {
+      await initializeSandbox(
+        runtimeConfigForActiveMode(),
+        runtimeAllowancesForActiveMode(),
+        cwd,
+        (host) => handleRuntimeBlockedDomain(host, cwd),
+        loaded.protectedWritePaths,
+        bootstrapShellPaths,
+      );
+    } catch (error) {
+      state = "failed";
+      if (previousConfig) {
+        try {
+          await SandboxManager.reset();
+          await SandboxManager.initialize(
+            previousConfig,
+            async ({ host }) => handleRuntimeBlockedDomain(host, cwd),
+            true,
+          );
+          state = "active";
+        } catch {
+          // The previous sandbox could not be restored; failed remains fail-closed.
+        }
+      }
+      throw error;
+    } finally {
+      if (activeCtx) updateStatus(activeCtx);
+    }
+  }
+
+  function grantTarget(choice: Exclude<PermissionChoice, "abort">): string | undefined {
+    if (choice === "session") return undefined;
+    const paths = requirePolicy().paths;
+    return choice === "project"
+      ? paths.projectGrantPath
+      : (paths.globalModePath ?? paths.globalBasePath);
+  }
+
+  async function applyChoice(
+    choice: Exclude<PermissionChoice, "abort">,
+    kind: GrantKind,
+    value: string,
+    cwd: string,
+    refresh = true,
+  ): Promise<void> {
+    await serialize(async () => {
+      const allowances = getModeAllowances();
+      const list =
+        kind === "domain"
+          ? allowances.domains
+          : kind === "read"
+            ? allowances.readPaths
+            : allowances.writePaths;
+      const added = !list.includes(value);
+      if (added) list.push(value);
+      try {
+        if (refresh) await refreshSandbox(cwd);
+      } catch (error) {
+        if (added) list.splice(list.indexOf(value), 1);
+        throw error;
+      }
+      const target = grantTarget(choice);
+      if (target) {
+        const version = requirePolicy().config.policyVersion ?? 1;
+        if (kind === "domain") addDomainToConfig(target, value, version);
+        else if (kind === "read") addReadPathToConfig(target, value, version);
+        else addWritePathToConfig(target, value, version);
+      }
+    });
+  }
+
+  async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
+    const loaded = requirePolicy();
+    const allowed = [
+      ...(loaded.config.network.allowedDomains ?? []),
+      ...getModeAllowances().domains,
+    ];
+    if (domainIsAllowed(host, allowed)) return true;
+    const existing = pendingDomainPrompts.get(host);
+    if (existing) return existing;
+    const prompt = (async () => {
+      if (getModePolicy(activeMode).network === "deny") return false;
+      const ctx = activeToolCtx ?? activeCtx;
+      if (!ctx) return false;
+      const choice = await promptDomainBlock(ctx, host);
+      if (choice === "abort") return false;
+      await applyChoice(choice, "domain", host, ctx.cwd ?? cwd, false);
+      SandboxManager.updateConfig(
+        buildRuntimeConfig(
+          runtimeConfigForActiveMode(),
+          runtimeAllowancesForActiveMode(),
+          ctx.cwd ?? cwd,
+          loaded.protectedWritePaths,
+          bootstrapShellPaths,
+        ),
+      );
+      return true;
+    })().finally(() => pendingDomainPrompts.delete(host));
+    pendingDomainPrompts.set(host, prompt);
+    return prompt;
+  }
+
+  function structuredHardReadPatterns(): string[] {
+    const config = requirePolicy().config;
+    return [
+      ...config.filesystem.denyRead,
+      ...(config.credentials?.files ?? []).map((entry) => entry.path),
+    ];
+  }
+
+  function readDecision(path: string, cwd: string) {
+    const loaded = requirePolicy();
+    const config = loaded.config;
+    return evaluateReadPolicy({
+      path,
+      cwd,
+      policyVersion: config.policyVersion ?? 1,
+      readScope: config.filesystem.readScope ?? "open",
+      denyRead: structuredHardReadPatterns(),
+      allowRead: effectiveReadPaths(),
+      modeBehavior: getModePolicy(activeMode).read,
+    });
+  }
+
+  function isHardWriteDenied(path: string, cwd: string): boolean {
+    const loaded = requirePolicy();
+    return matchesPattern(
+      path,
+      [
+        ...loaded.config.filesystem.denyWrite,
+        ...structuredHardReadPatterns(),
+        ...loaded.protectedWritePaths,
+      ],
+      cwd,
+    );
   }
 
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      const runBash = async () => {
-        const runId = ++activeToolRunId;
+      return serializeBash(async () => {
+        if (state !== "active") {
+          if (state === "disabled-by-user")
+            return localBash.execute(id, params, signal, onUpdate, ctx);
+          return textResult(`Blocked: sandbox state is ${state}; refusing unsandboxed agent bash.`);
+        }
         activeToolCtx = ctx;
+        let result: AgentToolResult<any>;
         try {
-          if (!sandboxEnabled || !sandboxInitialized) {
-            return await localBash.execute(id, params, signal, onUpdate, ctx);
-          }
-          return await createBashToolDefinition(localCwd, {
+          result = await createBashToolDefinition(localCwd, {
             operations: createSandboxedBashOps(userShellPath),
             shellPath: userShellPath,
           }).execute(id, params, signal, onUpdate, ctx);
+        } catch (error) {
+          if (!(error instanceof Error) || !extractSandboxViolation(error.message)) throw error;
+          result = textResult(`Command failed with OS-level sandbox restriction: ${error.message}`);
         } finally {
-          if (activeToolRunId === runId) activeToolCtx = undefined;
+          activeToolCtx = undefined;
         }
-      };
 
-      let result: AgentToolResult<any>;
-      try {
-        result = await runBash();
-      } catch (error) {
-        if (!(error instanceof Error) || !extractSandboxViolation(error.message)) {
-          throw error;
-        }
-        result = {
-          content: [
-            {
-              type: "text",
-              text: `Error: Command failed with OS-level sandbox restriction: ${error.message}`,
-            },
-          ],
-          details: {},
-        };
-      }
-
-      if (sandboxEnabled && sandboxInitialized) {
         const output = result.content
           .filter((content: any) => content.type === "text")
           .map((content: any) => content.text)
           .join("\n");
         const violation = extractSandboxViolation(output);
+        if (!violation) return result;
 
-        if (violation?.type === "read") {
-          const policy = getModePolicy(activeMode);
-          if (policy.read === "deny") {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Blocked by sandbox mode "${activeMode}": reads are not permitted.\n` +
-                    `Attempted read path: ${violation.path}`,
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const choice = await promptReadBlock(ctx, violation.path);
-          if (choice !== "abort") {
-            await applyChoice(choice, "read", violation.path, ctx.cwd);
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Read access granted for "${violation.path}", retrying ---\n`,
-                },
-              ],
-              details: {},
-            });
-            return runBash();
-          }
-        }
-
-        if (violation?.type === "write") {
-          const blockedPath = violation.path;
-          const policy = getModePolicy(activeMode);
-          if (policy.write === "deny") {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Blocked by sandbox mode "${activeMode}": writes are not permitted.\n` +
-                    `Attempted write path: ${blockedPath}\n` +
-                    `Ask the user to switch to "build" mode if file changes are required.`,
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const choice = await promptWriteBlock(ctx, blockedPath);
-          if (choice !== "abort") {
-            await applyChoice(choice, "write", blockedPath, ctx.cwd);
-            const config = loadConfig(ctx.cwd, activeMode);
-            const paths = getConfigPaths(ctx.cwd, activeMode);
-            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
-              ctx.ui.notify(
-                `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-                  `Check denyWrite in:\n  ${paths.projectModePath ?? paths.projectBasePath}\n  ${paths.globalModePath ?? paths.globalBasePath}`,
-                "warning",
+        if (violation.type === "read") {
+          const decision = readDecision(violation.path, ctx.cwd);
+          if (decision === "hard-deny" || decision === "mode-deny") return result;
+          // Only macOS Seatbelt supplies attributable read-denial events.
+          if (process.platform === "darwin") {
+            const choice = await promptReadBlock(ctx, violation.path);
+            if (choice !== "abort") {
+              await applyChoice(choice, "read", canonicalizePath(violation.path, ctx.cwd), ctx.cwd);
+              return textResult(
+                `Read access granted for "${violation.path}". The command was not retried because it may already have produced side effects; run a fresh command.`,
               );
-              return result;
             }
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Write access granted for "${blockedPath}", retrying ---\n`,
-                },
-              ],
-              details: {},
-            });
-            return runBash();
+          }
+        } else if (violation.type === "write") {
+          if (
+            isHardWriteDenied(violation.path, ctx.cwd) ||
+            getModePolicy(activeMode).write === "deny"
+          ) {
+            return result;
+          }
+          const choice = await promptWriteBlock(ctx, violation.path);
+          if (choice !== "abort") {
+            await applyChoice(choice, "write", canonicalizePath(violation.path, ctx.cwd), ctx.cwd);
+            return textResult(
+              `Write access granted for "${violation.path}". The command was not retried because it may already have produced side effects; run a fresh command.`,
+            );
           }
         }
+        return result;
+      });
+    },
+  });
 
-        if (violation?.type === "network") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Blocked by sandbox network policy: ${violation.host ?? violation.raw}`,
-              },
-            ],
-            details: {},
-          };
-        }
+  pi.registerTool({
+    name: "request_sandbox_access",
+    label: "Request sandbox access",
+    description:
+      "Ask the user for explicit filesystem access. Use this when a sandboxed command needs a known path; this tool never grants access without user approval.",
+    parameters: Type.Object({
+      operation: Type.Union([Type.Literal("read"), Type.Literal("write")]),
+      path: Type.String(),
+      reason: Type.String(),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (state !== "active") return textResult(`Sandbox is ${state}; access cannot be granted.`);
+      const path = canonicalizePath(params.path, ctx.cwd);
+      if (params.operation === "read" && readDecision(path, ctx.cwd) === "hard-deny") {
+        return textResult(
+          `Denied: "${path}" is covered by denyRead and cannot be granted interactively.`,
+        );
       }
-      return result;
+      if (params.operation === "write" && isHardWriteDenied(path, ctx.cwd)) {
+        return textResult(`Denied: "${path}" is covered by a hard write deny.`);
+      }
+      const choice = await promptAccessRequest(ctx, params.operation, path, params.reason);
+      if (choice === "abort")
+        return textResult(`User denied ${params.operation} access to "${path}".`);
+      await applyChoice(choice, params.operation, path, ctx.cwd);
+      return textResult(`${params.operation} access granted for "${path}". Run a fresh operation.`);
     },
   });
 
   pi.on("user_bash", async () => {
-    if (!sandboxEnabled || !sandboxInitialized) return;
-    return { operations: createSandboxedBashOps(userShellPath) };
+    if (state === "active") {
+      const operations = createSandboxedBashOps(userShellPath);
+      return {
+        operations: {
+          exec: (...args: Parameters<typeof operations.exec>) =>
+            serializeBash(() => operations.exec(...args)),
+        },
+      };
+    }
+    if (state === "disabled-by-user") return;
+    return {
+      result: {
+        output: `Blocked: sandbox state is ${state}; refusing unsandboxed command.`,
+        exitCode: 126,
+        cancelled: false,
+        truncated: false,
+      },
+    };
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!sandboxEnabled) return;
-    const config = loadConfig(ctx.cwd, activeMode);
-    if (!config.enabled) return;
-    const paths = getConfigPaths(ctx.cwd, activeMode);
-    const projectPath = paths.projectModePath ?? paths.projectBasePath;
-    const globalPath = paths.globalModePath ?? paths.globalBasePath;
+    if (state !== "active") {
+      if (state === "disabled-by-user") return;
+      return { block: true, reason: `Sandbox is ${state}; tool execution is blocked fail-closed.` };
+    }
+    const pathForRecursiveTool =
+      isToolCallEventType("grep", event) || isToolCallEventType("find", event)
+        ? (event.input.path ?? ".")
+        : isToolCallEventType("ls", event)
+          ? (event.input.path ?? ".")
+          : undefined;
 
-    if (isToolCallEventType("read", event)) {
-      const path = canonicalizePath(event.input.path);
-      const denyRead = config.filesystem?.denyRead ?? [];
-      if (matchesPattern(path, denyRead)) {
+    if (pathForRecursiveTool !== undefined) {
+      const root = canonicalizePath(pathForRecursiveTool, ctx.cwd);
+      const decision = readDecision(root, ctx.cwd);
+      if (decision === "hard-deny" || decision === "mode-deny") {
+        return {
+          block: true,
+          reason: `Sandbox blocks recursive read root "${root}" (${decision}).`,
+        };
+      }
+      if (decision === "prompt") {
+        const choice = await promptReadBlock(ctx, root);
+        if (choice === "abort")
+          return { block: true, reason: `Sandbox denied read access to "${root}".` };
+        await applyChoice(choice, "read", root, ctx.cwd);
+      }
+      const nested = hardDeniesWithin(root, structuredHardReadPatterns(), ctx.cwd);
+      if (nested.length) {
         return {
           block: true,
           reason:
-            `Sandbox: read access denied for "${path}" (in denyRead). ` +
-            `To change this, edit denyRead in:\n  ${projectPath}\n  ${globalPath}`,
+            `Sandbox blocked recursive ${event.toolName} because "${root}" contains hard-denied descendants: ` +
+            nested.join(", ") +
+            ". Use a narrower allowed path.",
         };
       }
-      if (!matchesPattern(path, effectiveReadPaths(ctx.cwd))) {
-        const policy = getModePolicy(activeMode);
-        if (policy.read === "deny") {
-          return {
-            block: true,
-            reason: `Sandbox mode "${activeMode}" blocks read access to "${path}".`,
-          };
-        }
-        const choice = await promptReadBlock(ctx, path);
-        if (choice === "abort") {
-          return { block: true, reason: `Sandbox: read access denied for "${path}"` };
-        }
-        await applyChoice(choice, "read", path, ctx.cwd);
-        return;
+      return;
+    }
+
+    if (isToolCallEventType("read", event)) {
+      const path = canonicalizePath(event.input.path, ctx.cwd);
+      const decision = readDecision(path, ctx.cwd);
+      if (decision === "hard-deny" || decision === "mode-deny") {
+        return { block: true, reason: `Sandbox blocks read access to "${path}" (${decision}).` };
       }
+      if (decision === "prompt") {
+        const choice = await promptReadBlock(ctx, path);
+        if (choice === "abort")
+          return { block: true, reason: `Sandbox denied read access to "${path}".` };
+        await applyChoice(choice, "read", path, ctx.cwd);
+      }
+      event.input.path = path;
+      return;
     }
 
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = canonicalizePath((event.input as { path: string }).path);
-      const denyWrite = config.filesystem?.denyWrite ?? [];
-      if (matchesPattern(path, denyWrite)) {
-        return {
-          block: true,
-          reason:
-            `Sandbox: write access denied for "${path}" (in denyWrite). ` +
-            `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-        };
+      const path = canonicalizePath(event.input.path, ctx.cwd);
+      if (isHardWriteDenied(path, ctx.cwd)) {
+        return { block: true, reason: `Sandbox hard-denies writes to "${path}".` };
       }
-      const policy = getModePolicy(activeMode);
-      if (policy.write === "deny") {
-        return {
-          block: true,
-          reason:
-            `Sandbox mode "${activeMode}" does not permit writes to "${path}". ` +
-            `Current mode allows research and inspection only. Ask the user to switch to "build" mode if file changes are required.`,
-        };
+      if (getModePolicy(activeMode).write === "deny") {
+        return { block: true, reason: `Sandbox mode "${activeMode}" denies writes.` };
       }
-      if (shouldPromptForWrite(path, effectiveWritePaths(ctx.cwd), matchesPattern)) {
+      if (!matchesPattern(path, effectiveWritePaths(), ctx.cwd)) {
         const choice = await promptWriteBlock(ctx, path);
-        if (choice === "abort") {
-          return {
-            block: true,
-            reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
-          };
-        }
+        if (choice === "abort")
+          return { block: true, reason: `Sandbox denied write access to "${path}".` };
         await applyChoice(choice, "write", path, ctx.cwd);
-        return;
       }
+      event.input.path = path;
     }
   });
 
   pi.on("session_start", async (_event, ctx) => {
     activeMode =
       ((pi.getFlag("sandbox-mode") as string | undefined) || DEFAULT_MODE).trim() || DEFAULT_MODE;
-    if (pi.getFlag("no-sandbox") as boolean) {
-      sandboxEnabled = false;
-      ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
-      return;
+    activeCtx = ctx;
+    try {
+      const loaded = loadPolicySnapshot(ctx);
+      if (pi.getFlag("no-sandbox") as boolean) {
+        state = "disabled-by-user";
+        ctx.ui.notify("Sandbox explicitly disabled via --no-sandbox", "warning");
+        updateStatus(ctx);
+        return;
+      }
+      if (!loaded.config.enabled) {
+        state = "disabled-by-user";
+        ctx.ui.notify("Sandbox disabled via trusted user configuration", "warning");
+        updateStatus(ctx);
+        return;
+      }
+      await startSandbox(ctx, true);
+    } catch (error) {
+      state = "failed";
+      ctx.ui.notify(`Sandbox policy failed to load; tools are blocked: ${error}`, "error");
     }
-    if (!loadConfig(ctx.cwd, activeMode).enabled) {
-      sandboxEnabled = false;
-      ctx.ui.notify("Sandbox disabled via config", "info");
-      return;
-    }
-    await enableSandbox(ctx, true);
   });
 
   pi.on("session_shutdown", async () => {
-    if (!sandboxInitialized) return;
+    if (state !== "active") return;
     try {
       await SandboxManager.reset();
     } catch {
-      // Ignore cleanup errors.
+      // Cleanup is best effort; no more tools run after shutdown.
     }
   });
 
   pi.registerCommand("sandbox-enable", {
     description: "Enable the sandbox for this session",
     handler: async (_args, ctx) => {
-      if (sandboxEnabled) {
-        ctx.ui.notify("Sandbox is already enabled", "info");
-        return;
+      try {
+        loadPolicySnapshot(ctx);
+        if (state === "active") return void ctx.ui.notify("Sandbox is already enabled", "info");
+        if (await startSandbox(ctx, false)) ctx.ui.notify("Sandbox enabled", "info");
+      } catch (error) {
+        state = "failed";
+        ctx.ui.notify(`Sandbox could not be enabled: ${error}`, "error");
       }
-      if (await enableSandbox(ctx, false)) ctx.ui.notify("Sandbox enabled", "info");
     },
   });
 
   pi.registerCommand("sandbox-disable", {
-    description: "Disable the sandbox for this session",
+    description: "Explicitly disable the sandbox for this session",
     handler: async (_args, ctx) => {
-      if (!sandboxEnabled) {
-        ctx.ui.notify("Sandbox is already disabled", "info");
-        return;
-      }
-      if (sandboxInitialized) {
-        try {
-          await SandboxManager.reset();
-        } catch {
-          // Ignore cleanup errors.
-        }
-      }
-      sandboxEnabled = false;
-      sandboxInitialized = false;
-      ctx.ui.setStatus("sandbox", "");
-      ctx.ui.notify("Sandbox disabled", "info");
+      if (state === "active") await SandboxManager.reset();
+      state = "disabled-by-user";
+      updateStatus(ctx);
+      ctx.ui.notify("Sandbox explicitly disabled; commands run with user permissions", "warning");
     },
   });
 
@@ -502,38 +611,77 @@ export default function (pi: ExtensionAPI) {
     description: "Show or switch sandbox mode",
     handler: async (args, ctx) => {
       const requestedMode = commandArgText(args);
-      if (!requestedMode) {
-        ctx.ui.notify(`Active sandbox mode: ${activeMode}`, "info");
-        return;
-      }
-
-      activeMode = requestedMode;
-      const config = loadConfig(ctx.cwd, activeMode);
-      if (sandboxEnabled && config.enabled) {
-        if (sandboxInitialized) await refreshSandbox(ctx.cwd);
-        else await enableSandbox(ctx, false);
-        updateStatus(ctx, config);
-      } else if (!config.enabled) {
-        ctx.ui.notify(`Sandbox config is disabled for mode "${activeMode}"`, "warning");
-      }
+      if (!requestedMode) return void ctx.ui.notify(`Active sandbox mode: ${activeMode}`, "info");
+      await serialize(async () => {
+        const previousMode = activeMode;
+        const previousPolicy = policy;
+        activeMode = requestedMode;
+        try {
+          loadPolicySnapshot(ctx);
+          if (state === "active") await refreshSandbox(ctx.cwd);
+          updateStatus(ctx);
+        } catch (error) {
+          activeMode = previousMode;
+          policy = previousPolicy;
+          throw error;
+        }
+      });
       ctx.ui.notify(`Sandbox mode switched to "${activeMode}"`, "info");
     },
   });
 
-  pi.registerCommand("sandbox", {
-    description: "Show sandbox configuration",
+  async function commandGrant(
+    kind: "read" | "write",
+    args: unknown,
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+  ) {
+    const raw = commandArgText(args);
+    if (!raw) return void ctx.ui.notify(`Usage: /sandbox-allow-${kind} <path>`, "warning");
+    const path = canonicalizePath(raw, ctx.cwd);
+    if (kind === "read" && readDecision(path, ctx.cwd) === "hard-deny") {
+      return void ctx.ui.notify(`Cannot grant hard-denied read path: ${path}`, "error");
+    }
+    if (kind === "write" && isHardWriteDenied(path, ctx.cwd)) {
+      return void ctx.ui.notify(`Cannot grant hard-denied write path: ${path}`, "error");
+    }
+    await applyChoice("session", kind, path, ctx.cwd);
+    ctx.ui.notify(`Session ${kind} access granted: ${path}`, "info");
+  }
+
+  pi.registerCommand("sandbox-allow-read", {
+    description: "Grant session read access to an explicit path",
+    handler: (args, ctx) => commandGrant("read", args, ctx),
+  });
+  pi.registerCommand("sandbox-allow-write", {
+    description: "Grant session write access to an explicit path",
+    handler: (args, ctx) => commandGrant("write", args, ctx),
+  });
+
+  pi.registerCommand("sandbox-migrate", {
+    description: "Explain legacy policy migration to policyVersion 2",
     handler: async (_args, ctx) => {
-      if (!sandboxEnabled) {
-        ctx.ui.notify("Sandbox is disabled", "info");
+      const loaded = requirePolicy();
+      if (loaded.config.policyVersion === 2) {
+        ctx.ui.notify("Sandbox policy already uses policyVersion 2", "info");
         return;
       }
       ctx.ui.notify(
-        formatSandboxConfiguration(
-          loadConfig(ctx.cwd, activeMode),
-          getConfigPaths(ctx.cwd, activeMode),
-          getModeAllowances(),
-          activeMode,
-        ),
+        "Legacy policy detected. Add policyVersion: 2 and filesystem.readScope: home. " +
+          "Legacy denyRead entries were broad scope boundaries where allowRead won; review them before moving true secrets into v2 denyRead, where deny always wins.",
+        "warning",
+      );
+    },
+  });
+
+  pi.registerCommand("sandbox", {
+    description: "Show effective sandbox configuration",
+    handler: async (_args, ctx) => {
+      if (!policy) return void ctx.ui.notify(`Sandbox is ${state}`, "info");
+      ctx.ui.notify(
+        formatSandboxConfiguration(policy, getModeAllowances(), activeMode, state, [
+          ...getRuntimeBootstrapReadPaths(ctx.cwd, policy.config.filesystem.readScope === "strict"),
+          ...bootstrapShellPaths,
+        ]),
         "info",
       );
     },

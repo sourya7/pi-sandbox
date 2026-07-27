@@ -37,10 +37,11 @@
     "ci:check": "npm run check",
     "ci:test": "npm test",
     "runtime:build": "npm --prefix sandbox-runtime run build",
-    "runtime:setup": "npm --prefix sandbox-runtime install && npm run runtime:build && npm install --no-save --package-lock=false ./sandbox-runtime"
+    "runtime:setup": "npm --prefix sandbox-runtime install && npm run runtime:build && npm install --ignore-scripts"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.66"
+    "@anthropic-ai/sandbox-runtime": "file:./sandbox-runtime",
+    "typebox": "1.1.38"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.0",

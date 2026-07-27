@@ -1,7 +1,7 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
-import { type SandboxConfig, type SandboxConfigPaths } from "./config.ts";
+import { type LoadedSandboxPolicy, type SandboxConfig } from "./config.ts";
 import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
@@ -24,7 +24,7 @@ const PERMISSION_OPTIONS: PromptOption[] = [
     key: "P",
     action: "project",
     confirm: true,
-    hint: "→ .pi/sandbox.json",
+    hint: "→ user-owned project grant",
   },
   {
     label: "Allow for all projects",
@@ -142,6 +142,19 @@ export function promptWriteBlock(ctx: ExtensionContext, path: string): Promise<P
   return showPermissionPrompt(ctx, `📝 Write blocked: "${path}" is not in allowWrite`);
 }
 
+export function promptAccessRequest(
+  ctx: ExtensionContext,
+  operation: "read" | "write",
+  path: string,
+  reason: string,
+): Promise<PermissionChoice> {
+  const icon = operation === "read" ? "📖" : "📝";
+  return showPermissionPrompt(
+    ctx,
+    `${icon} Agent requests ${operation} access to "${path}"\nReason: ${reason}`,
+  );
+}
+
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
   if (!allowsAllDomains(config.network?.allowedDomains)) return;
   ctx.ui.notify(
@@ -151,40 +164,55 @@ export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxCo
   );
 }
 
-export function formatSandboxStatus(config: SandboxConfig, mode = DEFAULT_MODE): string {
+export function formatSandboxStatus(
+  config: SandboxConfig,
+  mode = DEFAULT_MODE,
+  state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
+): string {
+  if (state === "failed") return "⛔ Sandbox unavailable — tools blocked";
+  if (state === "initializing") return "⏳ Sandbox initializing — tools blocked";
+  if (state === "disabled-by-user") return "⚠️ Sandbox explicitly disabled";
   const networkLabel = allowsAllDomains(config.network?.allowedDomains)
     ? "all domains"
     : `${config.network?.allowedDomains?.length ?? 0} domains`;
-  const policy = getModePolicy(mode);
+  const modePolicy = getModePolicy(mode);
   const writeLabel =
-    policy.write === "deny"
+    modePolicy.write === "deny"
       ? "writes denied"
-      : `${config.filesystem?.allowWrite?.length ?? 0} write paths`;
-  return `🔒 Sandbox: ${mode}, ${networkLabel}, ${writeLabel}`;
+      : `${config.filesystem.allowWrite.length} write paths`;
+  const scope = config.policyVersion === 2 ? (config.filesystem.readScope ?? "home") : "legacy";
+  return `🔒 Sandbox: ${mode} · read ${scope} · ${writeLabel} · ${networkLabel}`;
 }
 
 export function formatSandboxConfiguration(
-  config: SandboxConfig,
-  paths: SandboxConfigPaths,
+  loaded: LoadedSandboxPolicy,
   allowances: SessionAllowances,
   mode = DEFAULT_MODE,
+  state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
+  bootstrapReadPaths: string[] = [],
 ): string {
-  const policy = getModePolicy(mode);
+  const { config, paths } = loaded;
+  const modePolicy = getModePolicy(mode);
   return [
     "Sandbox Configuration",
+    `  State: ${state}`,
+    `  Policy version: ${config.policyVersion ?? 1}`,
     `  Active mode: ${mode}`,
+    `  Project policy trusted: ${loaded.projectTrusted ? "yes" : "no"}`,
+    `  Read scope: ${config.filesystem.readScope ?? "legacy"}`,
     "  Mode policy:",
-    `    Read:    ${policy.read}`,
-    `    Write:   ${policy.write}`,
-    `    Network: ${policy.network}`,
+    `    Read:    ${modePolicy.read}`,
+    `    Write:   ${modePolicy.write}`,
+    `    Network: ${modePolicy.network}`,
     "",
     "Config files:",
     `  Global base:  ${paths.globalBasePath}`,
     `  Global mode:  ${paths.globalModePath ?? "(none)"}`,
     `  Project base: ${paths.projectBasePath}`,
     `  Project mode: ${paths.projectModePath ?? "(none)"}`,
+    `  Project grants (user-owned): ${paths.projectGrantPath}`,
     "",
-    "Network (bash + !cmd):",
+    "Network (sandboxed bash + !cmd):",
     `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
     ...(allowsAllDomains(config.network?.allowedDomains)
       ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
@@ -192,17 +220,34 @@ export function formatSandboxConfiguration(
     `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
     ...(allowances.domains.length ? [`  Session allowed: ${allowances.domains.join(", ")}`] : []),
     "",
-    "Filesystem (bash + read/write/edit tools):",
-    `  Deny Read:   ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
-    `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
-    `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-    `  Deny Write:  ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
-    ...(allowances.readPaths.length ? [`  Session read:  ${allowances.readPaths.join(", ")}`] : []),
-    ...(allowances.writePaths.length
-      ? [`  Session write: ${allowances.writePaths.join(", ")}`]
+    "Filesystem:",
+    `  Hard deny read: ${config.filesystem.denyRead.join(", ") || "(none)"}`,
+    `  Allow read:     ${config.filesystem.allowRead?.join(", ") || "(none)"}`,
+    `  Allow write:    ${config.filesystem.allowWrite.join(", ") || "(none)"}`,
+    "  Implicit read:  every allowWrite path (except hard-denied descendants)",
+    `  Bootstrap read: ${[...new Set(bootstrapReadPaths)].join(", ") || "(none)"}`,
+    `  Deny write:     ${config.filesystem.denyWrite.join(", ") || "(none)"}`,
+    ...(allowances.readPaths.length
+      ? [`  Session read:    ${allowances.readPaths.join(", ")}`]
       : []),
+    ...(allowances.writePaths.length
+      ? [`  Session write:   ${allowances.writePaths.join(", ")}`]
+      : []),
+    `  Protected policy files: ${loaded.protectedWritePaths.join(", ")}`,
     "",
-    "Note: ALL reads are prompted unless the path is already in allowRead.",
-    "Note: denyRead and denyWrite take PRECEDENCE over allow lists and are never prompted.",
+    "Isolation controls:",
+    `  Filesystem disabled: ${config.filesystem.disabled === true ? "YES" : "no"}`,
+    `  Weaker network isolation: ${config.enableWeakerNetworkIsolation === true ? "YES" : "no"}`,
+    `  Weaker nested sandbox: ${config.enableWeakerNestedSandbox === true ? "YES" : "no"}`,
+    `  Credential rules configured: ${config.credentials ? "yes" : "no; child environment may contain credentials"}`,
+    "",
+    ...(loaded.warnings.length
+      ? ["Warnings:", ...loaded.warnings.map((warning) => `  ${warning}`), ""]
+      : []),
+    process.platform === "darwin"
+      ? "macOS bash: attributable unknown reads may be prompted after failure; commands are never retried automatically."
+      : "Linux bash: unknown reads fail closed; use request_sandbox_access or /sandbox-allow-read.",
+    "Recursive grep/find/ls are blocked when their root contains a hard-denied descendant.",
+    "Trusted custom extensions/tools are outside this extension's automatic boundary.",
   ].join("\n");
 }

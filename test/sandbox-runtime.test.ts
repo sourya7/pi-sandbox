@@ -23,6 +23,10 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.equal(runtime.network?.allowedDomains?.includes("example.com"), true);
   assert.equal(runtime.filesystem?.allowRead?.includes("/read"), true);
   assert.equal(runtime.filesystem?.allowWrite?.includes("/write"), true);
+  assert.equal(runtime.filesystem?.allowRead?.includes("/write"), true);
+  assert.deepEqual(runtime.filesystem?.denyRead, [process.env.HOME]);
+  assert.deepEqual(runtime.filesystem?.denyReadAlways, []);
+  assert.equal(runtime.enableWeakerNetworkIsolation, false);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
 });
 
@@ -103,6 +107,47 @@ test("extractSandboxViolation classifies read, write, and network annotations", 
       raw: 'deny(1) network-outbound remote ip "example.com:443"',
     },
   );
+});
+
+test("v2 runtime config maps user denyRead to authoritative final denies", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v2-runtime-"));
+  const secret = join(cwd, "secret");
+  const policyFile = join(cwd, ".pi", "sandbox.json");
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem,
+        readScope: "strict",
+        denyRead: [secret],
+        allowRead: [cwd],
+        allowWrite: [cwd],
+        denyWrite: [],
+      },
+    },
+    undefined,
+    cwd,
+    [policyFile],
+  );
+  assert.deepEqual(runtime.filesystem?.denyRead, ["/"]);
+  assert.equal(runtime.filesystem?.denyReadAlways?.includes(secret), true);
+  assert.equal(runtime.filesystem?.denyWrite.includes(secret), true);
+  assert.equal(runtime.filesystem?.denyWrite.includes(policyFile), true);
+});
+
+test("credential file deny rules use the final read-deny layer", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-credential-runtime-"));
+  const credential = join(cwd, "token");
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      credentials: { files: [{ path: credential, mode: "deny" }] },
+    },
+    undefined,
+    cwd,
+  );
+  assert.equal(runtime.filesystem?.denyReadAlways?.includes(credential), true);
+  assert.equal(runtime.filesystem?.denyWrite.includes(credential), true);
 });
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {
