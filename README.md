@@ -185,6 +185,39 @@ If neither file exists, built-in defaults apply (see above for the defaults).
 
 The footer shows a lock indicator while the sandbox is active.
 
+## Development
+
+Clone with the runtime submodule and install the normal project dependencies:
+
+```bash
+git clone --recurse-submodules https://github.com/sourya7/pi-sandbox.git
+cd pi-sandbox
+npm install
+npm run runtime:setup
+pi -e .
+```
+
+`runtime:setup` installs and builds the submodule, then links it as
+`@anthropic-ai/sandbox-runtime` for local development. After changing runtime
+source, run `npm run runtime:build` and restart pi.
+
+To bring upstream runtime changes into the fork:
+
+```bash
+cd sandbox-runtime
+git switch main
+git remote add upstream https://github.com/anthropic-experimental/sandbox-runtime.git # once
+git fetch upstream
+git merge upstream/main
+git push origin main
+cd ..
+git add sandbox-runtime
+```
+
+The parent repository records the exact runtime commit. Published installs
+continue to use the npm dependency declared in `package.json`; the local link
+only applies to this checkout.
+
 ## Ackowledgements
 Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)

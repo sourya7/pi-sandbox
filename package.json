@@ -35,7 +35,9 @@
     "ci:fmt": "oxfmt --check index.ts src test",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
-    "ci:test": "npm test"
+    "ci:test": "npm test",
+    "runtime:build": "npm --prefix sandbox-runtime run build",
+    "runtime:setup": "npm --prefix sandbox-runtime install && npm run runtime:build && npm install --no-save --package-lock=false ./sandbox-runtime"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.66"
