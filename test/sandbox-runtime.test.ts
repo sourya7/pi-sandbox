@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -148,6 +149,39 @@ test("credential file deny rules use the final read-deny layer", () => {
   );
   assert.equal(runtime.filesystem?.denyReadAlways?.includes(credential), true);
   assert.equal(runtime.filesystem?.denyWrite.includes(credential), true);
+});
+
+test("cursor-aware annotation excludes historical violations", () => {
+  SandboxManager.updateConfig(buildRuntimeConfig(DEFAULT_CONFIG));
+  const store = SandboxManager.getSandboxViolationStore();
+  const command = "printf replay-test";
+  const encodedCommand = Buffer.from(command.slice(0, 100)).toString("base64");
+
+  store.clear();
+  try {
+    store.addViolation({
+      line: "deny openat /historical",
+      command,
+      encodedCommand,
+      timestamp: new Date(),
+    });
+    const cursor = store.getCursor();
+
+    assert.match(SandboxManager.annotateStderrWithSandboxFailures(command, ""), /historical/);
+    assert.equal(SandboxManager.annotateStderrWithSandboxFailures(command, "", cursor), "");
+
+    store.addViolation({
+      line: "deny openat /current",
+      command,
+      encodedCommand,
+      timestamp: new Date(),
+    });
+    const annotated = SandboxManager.annotateStderrWithSandboxFailures(command, "", cursor);
+    assert.doesNotMatch(annotated, /historical/);
+    assert.match(annotated, /current/);
+  } finally {
+    store.clear();
+  }
 });
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {

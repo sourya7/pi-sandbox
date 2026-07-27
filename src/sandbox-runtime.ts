@@ -287,6 +287,7 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
 
       const { shell, args } = getShellConfig(shellPath);
       const wrappedCommand = await SandboxManager.wrapWithSandbox(command, shell);
+      const violationCursor = SandboxManager.getSandboxViolationStore().getCursor();
 
       return new Promise((resolve, reject) => {
         const child = spawn(shell, [...args, wrappedCommand], {
@@ -329,19 +330,28 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
 
         signal?.addEventListener("abort", killProcessGroup, { once: true });
         child.on("close", (code) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          signal?.removeEventListener("abort", killProcessGroup);
+          void (async () => {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            signal?.removeEventListener("abort", killProcessGroup);
 
-          const annotatedStderr = SandboxManager.annotateStderrWithSandboxFailures(command, stderr);
-          if (annotatedStderr !== stderr) {
-            onData(Buffer.from(annotatedStderr.slice(stderr.length), "utf8"));
-          }
+            try {
+              await SandboxManager.waitForSandboxViolationDrain();
+              const annotatedStderr = SandboxManager.annotateStderrWithSandboxFailures(
+                command,
+                stderr,
+                violationCursor,
+              );
+              if (annotatedStderr !== stderr) {
+                onData(Buffer.from(annotatedStderr.slice(stderr.length), "utf8"));
+              }
+            } finally {
+              SandboxManager.cleanupAfterCommand();
+            }
 
-          SandboxManager.cleanupAfterCommand();
-
-          if (signal?.aborted) reject(new Error("aborted"));
-          else if (timedOut) reject(new Error(`timeout:${timeout}`));
-          else resolve({ exitCode: code });
+            if (signal?.aborted) reject(new Error("aborted"));
+            else if (timedOut) reject(new Error(`timeout:${timeout}`));
+            else resolve({ exitCode: code });
+          })().catch(reject);
         });
       });
     },
