@@ -143,11 +143,7 @@ Literal `allowRead` entries preserve symlink aliases and their resolved targets,
 
 V2 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
 
-### Legacy policies
-
-Existing configuration with no `policyVersion` remains v1. Legacy `denyRead` establishes broad denied regions and runtime `allowRead` can carve paths back out. It is not silently reinterpreted as a v2 hard deny.
-
-Use `/sandbox-migrate` for migration guidance. Review broad legacy entries before adding `policyVersion: 2`; move only true secrets into v2 `denyRead`, and express the broad boundary through `readScope`.
+Policies always use version 2 semantics. The `policyVersion` field may be omitted; if present, it must be `2`. Filesystem paths must be literals or use trailing `/**` subtree notation.
 
 ## Configuration trust and grants
 
@@ -197,7 +193,6 @@ pi --sandbox-mode read-only         start in a named mode
 /sandbox-disable                    explicit visible bypass for the current session
 /sandbox-allow-read <path>
 /sandbox-allow-write <path>
-/sandbox-migrate
 ```
 
 | Mode | Read | Write | Network |

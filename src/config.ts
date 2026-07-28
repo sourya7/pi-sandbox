@@ -28,7 +28,7 @@ export interface SandboxFilesystemConfig {
 }
 
 export interface SandboxConfig extends Omit<SandboxRuntimeConfig, "filesystem"> {
-  policyVersion?: 1 | 2;
+  policyVersion?: 2;
   enabled?: boolean;
   failClosed?: boolean;
   filesystem: SandboxFilesystemConfig;
@@ -76,16 +76,6 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     allowWrite: [".", "/tmp"],
     // V2 filesystem rules intentionally use portable literal/subtree paths.
     denyWrite: [".env"],
-  },
-};
-
-const LEGACY_DEFAULT_CONFIG: SandboxConfig = {
-  ...DEFAULT_CONFIG,
-  policyVersion: 1,
-  filesystem: {
-    ...DEFAULT_CONFIG.filesystem,
-    readScope: undefined,
-    denyWrite: [".env", ".env.*", "*.pem", "*.key"],
   },
 };
 
@@ -139,8 +129,8 @@ export function validateConfig(
   source = "sandbox configuration",
 ): Partial<SandboxConfig> {
   if (!isRecord(value)) throw new Error(`${source}: expected a JSON object`);
-  if (value.policyVersion !== undefined && value.policyVersion !== 1 && value.policyVersion !== 2) {
-    throw new Error(`${source}: policyVersion must be 1 or 2`);
+  if (value.policyVersion !== undefined && value.policyVersion !== 2) {
+    throw new Error(`${source}: only policyVersion 2 is supported; omit policyVersion or use 2`);
   }
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error(`${source}: enabled must be boolean`);
@@ -164,16 +154,14 @@ export function validateConfig(
     ) {
       throw new Error(`${source}: filesystem.readScope must be home, strict, or open`);
     }
-    if (value.policyVersion === 2) {
-      for (const field of ["denyRead", "allowRead", "allowWrite", "denyWrite"] as const) {
-        const bad = Array.isArray(filesystem[field])
-          ? (filesystem[field] as string[]).find(hasUnsupportedV2Glob)
-          : undefined;
-        if (bad) {
-          throw new Error(
-            `${source}: filesystem.${field} pattern "${bad}" is not portable in policyVersion 2`,
-          );
-        }
+    for (const field of ["denyRead", "allowRead", "allowWrite", "denyWrite"] as const) {
+      const bad = Array.isArray(filesystem[field])
+        ? (filesystem[field] as string[]).find(hasUnsupportedV2Glob)
+        : undefined;
+      if (bad) {
+        throw new Error(
+          `${source}: filesystem.${field} pattern "${bad}" is not portable; use a literal path or trailing /**`,
+        );
       }
     }
   }
@@ -254,8 +242,7 @@ function sanitizeProjectConfig(
   return { policyVersion: raw.policyVersion, network, filesystem } as Partial<SandboxConfig>;
 }
 
-function validateV2PortablePaths(config: SandboxConfig, source: string): void {
-  if (config.policyVersion !== 2) return;
+function validatePortablePaths(config: SandboxConfig, source: string): void {
   for (const [field, patterns] of Object.entries({
     denyRead: config.filesystem.denyRead,
     allowRead: config.filesystem.allowRead ?? [],
@@ -265,7 +252,7 @@ function validateV2PortablePaths(config: SandboxConfig, source: string): void {
     const bad = patterns.find(hasUnsupportedV2Glob);
     if (bad) {
       throw new Error(
-        `${source}: filesystem.${field} pattern "${bad}" is not portable in policyVersion 2; use a literal path or trailing /**`,
+        `${source}: filesystem.${field} pattern "${bad}" is not portable; use a literal path or trailing /**`,
       );
     }
   }
@@ -283,21 +270,16 @@ export function loadPolicy(
   const projectMode =
     projectTrusted && paths.projectModePath ? readJsonConfig(paths.projectModePath) : undefined;
   const projectGrant = readJsonConfig(paths.projectGrantPath);
-  const sources = [globalBase, globalMode, projectBase, projectMode, projectGrant].filter(
-    (entry): entry is Partial<SandboxConfig> => entry !== undefined,
-  );
-  const explicitV2 = sources.some((entry) => entry.policyVersion === 2);
-  const legacy = sources.length > 0 && !explicitV2;
-  let config: SandboxConfig = structuredClone(legacy ? LEGACY_DEFAULT_CONFIG : DEFAULT_CONFIG);
+  let config: SandboxConfig = structuredClone(DEFAULT_CONFIG);
   const warnings: string[] = [];
   for (const source of [globalBase, globalMode]) if (source) config = deepMerge(config, source);
   for (const source of [projectBase, projectMode]) {
     if (source) config = deepMerge(config, sanitizeProjectConfig(source, cwd, warnings));
   }
   if (projectGrant) config = deepMerge(config, projectGrant);
-  config.policyVersion = legacy ? 1 : 2;
-  if (config.policyVersion === 2) config.filesystem.readScope ??= "home";
-  validateV2PortablePaths(config, "effective sandbox policy");
+  config.policyVersion = 2;
+  config.filesystem.readScope ??= "home";
+  validatePortablePaths(config, "effective sandbox policy");
 
   const protectedWritePaths = [
     paths.globalBasePath,
@@ -332,16 +314,12 @@ function writeConfigFile(configPath: string, config: Partial<SandboxConfig>): vo
   }
 }
 
-function readWritableConfig(configPath: string, policyVersion: 1 | 2): Partial<SandboxConfig> {
-  return readJsonConfig(configPath) ?? { policyVersion };
+function readWritableConfig(configPath: string): Partial<SandboxConfig> {
+  return readJsonConfig(configPath) ?? { policyVersion: 2 };
 }
 
-export function addDomainToConfig(
-  configPath: string,
-  domain: string,
-  policyVersion: 1 | 2 = 2,
-): void {
-  const config = readWritableConfig(configPath, policyVersion);
+export function addDomainToConfig(configPath: string, domain: string): void {
+  const config = readWritableConfig(configPath);
   const existing = config.network?.allowedDomains ?? [];
   if (existing.includes(domain)) return;
   config.network = {
@@ -352,12 +330,8 @@ export function addDomainToConfig(
   writeConfigFile(configPath, config);
 }
 
-export function addReadPathToConfig(
-  configPath: string,
-  pathToAdd: string,
-  policyVersion: 1 | 2 = 2,
-): void {
-  const config = readWritableConfig(configPath, policyVersion);
+export function addReadPathToConfig(configPath: string, pathToAdd: string): void {
+  const config = readWritableConfig(configPath);
   const existing = config.filesystem?.allowRead ?? [];
   if (existing.includes(pathToAdd)) return;
   config.filesystem = {
@@ -370,12 +344,8 @@ export function addReadPathToConfig(
   writeConfigFile(configPath, config);
 }
 
-export function addWritePathToConfig(
-  configPath: string,
-  pathToAdd: string,
-  policyVersion: 1 | 2 = 2,
-): void {
-  const config = readWritableConfig(configPath, policyVersion);
+export function addWritePathToConfig(configPath: string, pathToAdd: string): void {
+  const config = readWritableConfig(configPath);
   const existing = config.filesystem?.allowWrite ?? [];
   if (existing.includes(pathToAdd)) return;
   config.filesystem = {

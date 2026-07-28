@@ -122,8 +122,7 @@ export function buildRuntimeConfig(
   additionalBootstrapReadPaths: string[] = [],
 ): SandboxRuntimeConfig {
   const filesystem = config.filesystem;
-  const version = config.policyVersion ?? 1;
-  const readScope = filesystem.readScope ?? (version === 2 ? "home" : "open");
+  const readScope = filesystem.readScope ?? "home";
   const writePaths = uniquePaths(
     [...filesystem.allowWrite, ...(allowances?.writePaths ?? [])],
     cwd,
@@ -142,24 +141,14 @@ export function buildRuntimeConfig(
     ...uniquePaths(additionalBootstrapReadPaths, cwd),
     ...uniqueLexicalPaths(additionalBootstrapReadPaths, cwd),
   ];
-  const scopeDeny =
-    version === 2
-      ? readScope === "strict"
-        ? ["/"]
-        : readScope === "home"
-          ? [homedir()]
-          : []
-      : uniquePaths(filesystem.denyRead, cwd);
+  const scopeDeny = readScope === "strict" ? ["/"] : readScope === "home" ? [homedir()] : [];
   const credentialHardRead = uniquePaths(
     (config.credentials?.files ?? [])
       .filter((entry) => entry.mode === "deny")
       .map((entry) => entry.path),
     cwd,
   );
-  const hardRead =
-    version === 2
-      ? uniquePaths([...filesystem.denyRead, ...credentialHardRead], cwd)
-      : credentialHardRead;
+  const hardRead = uniquePaths([...filesystem.denyRead, ...credentialHardRead], cwd);
   const denyWrite = uniquePaths(
     [...filesystem.denyWrite, ...hardRead, ...protectedWritePaths],
     cwd,

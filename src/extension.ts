@@ -287,10 +287,9 @@ export default function (pi: ExtensionAPI) {
       }
       const target = grantTarget(choice);
       if (target) {
-        const version = requirePolicy().config.policyVersion ?? 1;
-        if (kind === "domain") addDomainToConfig(target, value, version);
-        else if (kind === "read") addReadPathToConfig(target, value, version);
-        else addWritePathToConfig(target, value, version);
+        if (kind === "domain") addDomainToConfig(target, value);
+        else if (kind === "read") addReadPathToConfig(target, value);
+        else addWritePathToConfig(target, value);
       }
     });
   }
@@ -340,8 +339,7 @@ export default function (pi: ExtensionAPI) {
     return evaluateReadPolicy({
       path,
       cwd,
-      policyVersion: config.policyVersion ?? 1,
-      readScope: config.filesystem.readScope ?? "open",
+      readScope: config.filesystem.readScope ?? "home",
       denyRead: structuredHardReadPatterns(),
       allowRead: effectiveReadPaths(),
       modeBehavior: getModePolicy(activeMode).read,
@@ -655,22 +653,6 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("sandbox-allow-write", {
     description: "Grant session write access to an explicit path",
     handler: (args, ctx) => commandGrant("write", args, ctx),
-  });
-
-  pi.registerCommand("sandbox-migrate", {
-    description: "Explain legacy policy migration to policyVersion 2",
-    handler: async (_args, ctx) => {
-      const loaded = requirePolicy();
-      if (loaded.config.policyVersion === 2) {
-        ctx.ui.notify("Sandbox policy already uses policyVersion 2", "info");
-        return;
-      }
-      ctx.ui.notify(
-        "Legacy policy detected. Add policyVersion: 2 and filesystem.readScope: home. " +
-          "Legacy denyRead entries were broad scope boundaries where allowRead won; review them before moving true secrets into v2 denyRead, where deny always wins.",
-        "warning",
-      );
-    },
   });
 
   pi.registerCommand("sandbox", {

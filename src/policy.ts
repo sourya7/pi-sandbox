@@ -7,7 +7,6 @@ export type PathDecision = "hard-deny" | "mode-deny" | "allow" | "prompt" | "out
 export interface ReadPolicyInput {
   path: string;
   cwd: string;
-  policyVersion: 1 | 2;
   readScope: "home" | "strict" | "open";
   denyRead: string[];
   allowRead: string[];
@@ -130,8 +129,6 @@ export function evaluateReadPolicy(input: ReadPolicyInput): PathDecision {
   if (input.modeBehavior === "deny") return "mode-deny";
   if (matchesPattern(path, input.allowRead, input.cwd)) return "allow";
 
-  // Legacy policies retain the existing structured-tool prompt behavior.
-  if (input.policyVersion === 1) return "prompt";
   if (input.readScope === "open") return "outside-scope-allow";
   if (
     input.readScope === "home" &&

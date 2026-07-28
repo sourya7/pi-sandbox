@@ -180,7 +180,7 @@ export function formatSandboxStatus(
     modePolicy.write === "deny"
       ? "writes denied"
       : `${config.filesystem.allowWrite.length} write paths`;
-  const scope = config.policyVersion === 2 ? (config.filesystem.readScope ?? "home") : "legacy";
+  const scope = config.filesystem.readScope ?? "home";
   return `🔒 Sandbox: ${mode} · read ${scope} · ${writeLabel} · ${networkLabel}`;
 }
 
@@ -196,10 +196,10 @@ export function formatSandboxConfiguration(
   return [
     "Sandbox Configuration",
     `  State: ${state}`,
-    `  Policy version: ${config.policyVersion ?? 1}`,
+    "  Policy version: 2",
     `  Active mode: ${mode}`,
     `  Project policy trusted: ${loaded.projectTrusted ? "yes" : "no"}`,
-    `  Read scope: ${config.filesystem.readScope ?? "legacy"}`,
+    `  Read scope: ${config.filesystem.readScope ?? "home"}`,
     "  Mode policy:",
     `    Read:    ${modePolicy.read}`,
     `    Write:   ${modePolicy.write}`,

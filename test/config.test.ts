@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -104,6 +104,8 @@ test("loadConfig named mode adds project base and project mode arrays", () => {
   );
 
   const config = loadConfig(cwd, "read-only");
+  assert.equal(config.policyVersion, 2);
+  assert.equal(config.filesystem.readScope, "home");
   assert.equal(config.filesystem?.allowRead?.includes("."), true);
   assert.equal(config.filesystem?.allowRead?.includes("project-base"), true);
   assert.equal(config.filesystem?.allowRead?.includes("project-mode"), true);
@@ -142,6 +144,15 @@ test("trusted project cannot grant paths outside the project or disable sandbox"
   assert.equal(loaded.warnings.length >= 2, true);
 });
 
+test("grant writers create version 2 policy files", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-policy-write-"));
+  const configPath = join(cwd, "sandbox.json");
+  addReadPathToConfig(configPath, "/allowed");
+  const written = JSON.parse(readFileSync(configPath, "utf-8"));
+  assert.equal(written.policyVersion, 2);
+  assert.deepEqual(written.filesystem.allowRead, ["/allowed"]);
+});
+
 test("trusted grant writer refuses symlinked policy files", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-policy-write-"));
   const real = join(cwd, "real.json");
@@ -151,16 +162,19 @@ test("trusted grant writer refuses symlinked policy files", () => {
   assert.throws(() => addReadPathToConfig(link, "/allowed"), /symlinked sandbox policy/);
 });
 
-test("policy version 2 rejects non-portable filesystem globs", () => {
+test("versionless policies reject non-portable filesystem globs", () => {
   assert.throws(
     () =>
       validateConfig(
         {
-          policyVersion: 2,
           filesystem: { denyRead: ["**/.env"], allowRead: [], allowWrite: [], denyWrite: [] },
         },
         "test policy",
       ),
     /not portable/,
   );
+});
+
+test("policy version 1 is rejected", () => {
+  assert.throws(() => validateConfig({ policyVersion: 1 }, "test policy"), /only policyVersion 2/);
 });

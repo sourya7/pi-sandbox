@@ -61,7 +61,6 @@ test("v2 read policy applies hard deny before allow and scope", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-read-policy-"));
   const common = {
     cwd,
-    policyVersion: 2 as const,
     readScope: "strict" as const,
     denyRead: [join(cwd, "secret")],
     allowRead: [cwd],
@@ -78,7 +77,6 @@ test("open and home scopes allow paths outside their protected region", () => {
     evaluateReadPolicy({
       path: "/etc/hosts",
       cwd,
-      policyVersion: 2,
       readScope: "open",
       denyRead: [],
       allowRead: [],
@@ -97,7 +95,6 @@ test("home scope protects a home symlink even when its target is outside home", 
     const input = {
       path: link,
       cwd: container,
-      policyVersion: 2 as const,
       readScope: "home" as const,
       denyRead: [],
       allowRead: [],
