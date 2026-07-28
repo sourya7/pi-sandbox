@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,6 +29,28 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.deepEqual(runtime.filesystem?.denyReadAlways, []);
   assert.equal(runtime.enableWeakerNetworkIsolation, false);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
+});
+
+test("buildRuntimeConfig preserves a symlink allow path and its canonical target", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-link-"));
+  const target = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-target-"));
+  const link = join(cwd, "profile");
+  symlinkSync(target, link);
+  try {
+    const runtime = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        filesystem: { ...DEFAULT_CONFIG.filesystem, allowRead: [link] },
+      },
+      undefined,
+      cwd,
+    );
+    assert.equal(runtime.filesystem.allowRead?.includes(link), true);
+    assert.equal(runtime.filesystem.allowRead?.includes(target), true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
 });
 
 test("buildRuntimeConfig filters non-existent denyWrite leaves under unwritable parents", () => {

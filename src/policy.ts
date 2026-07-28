@@ -39,13 +39,13 @@ export function domainIsAllowed(domain: string, allowedDomains: string[]): boole
   return allowedDomains.some((pattern) => domainMatchesPattern(domain, pattern));
 }
 
-function expandPath(filePath: string, cwd: string): string {
+export function resolveLexicalPath(filePath: string, cwd = process.cwd()): string {
   const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
   return resolve(isAbsolute(expanded) ? expanded : resolve(cwd, expanded));
 }
 
 export function canonicalizePath(filePath: string, cwd = process.cwd()): string {
-  const absolutePath = expandPath(filePath, cwd);
+  const absolutePath = resolveLexicalPath(filePath, cwd);
   try {
     return realpathSync.native(absolutePath);
   } catch {
@@ -80,7 +80,7 @@ export function resolvePolicyPatterns(patterns: string[], cwd: string): string[]
   return patterns.map((pattern) => {
     const subtree = pattern.endsWith("/**");
     const raw = subtree ? pattern.slice(0, -3) || "/" : pattern;
-    if (containsGlob(raw)) return expandPath(raw, cwd);
+    if (containsGlob(raw)) return resolveLexicalPath(raw, cwd);
     const resolved = canonicalizePath(raw, cwd);
     return subtree ? `${resolved}/**` : resolved;
   });
@@ -111,6 +111,12 @@ export function matchesPattern(filePath: string, patterns: string[], cwd = proce
   });
 }
 
+function lexicalPathIsWithin(path: string, ancestor: string): boolean {
+  const candidate = resolveLexicalPath(path);
+  const root = resolveLexicalPath(ancestor);
+  return candidate === root || candidate.startsWith(root + "/");
+}
+
 export function pathIsWithin(path: string, ancestor: string): boolean {
   const candidate = canonicalizePath(path);
   const root = canonicalizePath(ancestor);
@@ -118,7 +124,8 @@ export function pathIsWithin(path: string, ancestor: string): boolean {
 }
 
 export function evaluateReadPolicy(input: ReadPolicyInput): PathDecision {
-  const path = canonicalizePath(input.path, input.cwd);
+  const lexicalPath = resolveLexicalPath(input.path, input.cwd);
+  const path = canonicalizePath(lexicalPath, input.cwd);
   if (matchesPattern(path, input.denyRead, input.cwd)) return "hard-deny";
   if (input.modeBehavior === "deny") return "mode-deny";
   if (matchesPattern(path, input.allowRead, input.cwd)) return "allow";
@@ -126,7 +133,11 @@ export function evaluateReadPolicy(input: ReadPolicyInput): PathDecision {
   // Legacy policies retain the existing structured-tool prompt behavior.
   if (input.policyVersion === 1) return "prompt";
   if (input.readScope === "open") return "outside-scope-allow";
-  if (input.readScope === "home" && !pathIsWithin(path, homedir())) {
+  if (
+    input.readScope === "home" &&
+    !lexicalPathIsWithin(lexicalPath, homedir()) &&
+    !pathIsWithin(path, homedir())
+  ) {
     return "outside-scope-allow";
   }
   return "prompt";

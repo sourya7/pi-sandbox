@@ -139,6 +139,8 @@ Within the protected region, priority is:
 
 `allowWrite` necessarily implies read access, except below a more-specific hard deny. Hard read denies are also protected from writes/renames so a process cannot move a secret into a readable location.
 
+Literal `allowRead` entries preserve symlink aliases and their resolved targets, including multi-link chains. Linux recreates allowed aliases hidden by the protected-region mount; macOS allows both spellings. Dangling links, cycles, and hard-denied targets remain blocked.
+
 V2 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
 
 ### Legacy policies

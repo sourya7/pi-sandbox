@@ -11,7 +11,12 @@ import {
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
-import { canonicalizePath, domainIsAllowed, resolvePolicyPatterns } from "./policy.ts";
+import {
+  canonicalizePath,
+  domainIsAllowed,
+  resolveLexicalPath,
+  resolvePolicyPatterns,
+} from "./policy.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -94,6 +99,21 @@ function uniquePaths(paths: string[], cwd: string): string[] {
   return [...new Set(resolvePolicyPatterns(paths, cwd).map((path) => path.replace(/\/\*\*$/, "")))];
 }
 
+/** Preserve the configured spelling as well as its canonical target. The
+ * runtime needs the lexical spelling to restore explicitly allowed symlink
+ * aliases inside a masked read scope. */
+function uniqueLexicalPaths(paths: string[], cwd: string): string[] {
+  return [
+    ...new Set(
+      paths.map((path) => {
+        const subtree = path.endsWith("/**");
+        const raw = subtree ? path.slice(0, -3) || "/" : path;
+        return resolveLexicalPath(raw, cwd);
+      }),
+    ),
+  ];
+}
+
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
@@ -108,13 +128,19 @@ export function buildRuntimeConfig(
     [...filesystem.allowWrite, ...(allowances?.writePaths ?? [])],
     cwd,
   );
-  const configuredRead = uniquePaths(
-    [...(filesystem.allowRead ?? []), ...(allowances?.readPaths ?? []), ...writePaths],
-    cwd,
-  );
+  const readInputs = [
+    ...(filesystem.allowRead ?? []),
+    ...(allowances?.readPaths ?? []),
+    ...filesystem.allowWrite,
+    ...(allowances?.writePaths ?? []),
+  ];
+  const configuredRead = [
+    ...new Set([...uniquePaths(readInputs, cwd), ...uniqueLexicalPaths(readInputs, cwd)]),
+  ];
   const bootstrap = [
     ...getRuntimeBootstrapReadPaths(cwd, readScope === "strict"),
     ...uniquePaths(additionalBootstrapReadPaths, cwd),
+    ...uniqueLexicalPaths(additionalBootstrapReadPaths, cwd),
   ];
   const scopeDeny =
     version === 2

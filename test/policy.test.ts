@@ -1,5 +1,5 @@
-import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -86,6 +86,29 @@ test("open and home scopes allow paths outside their protected region", () => {
     }),
     "outside-scope-allow",
   );
+});
+
+test("home scope protects a home symlink even when its target is outside home", () => {
+  const target = mkdtempSync(join(tmpdir(), "pi-sandbox-home-link-target-"));
+  const container = mkdtempSync(join(homedir(), ".pi-sandbox-home-link-"));
+  const link = join(container, "link");
+  symlinkSync(target, link);
+  try {
+    const input = {
+      path: link,
+      cwd: container,
+      policyVersion: 2 as const,
+      readScope: "home" as const,
+      denyRead: [],
+      allowRead: [],
+      modeBehavior: "prompt" as const,
+    };
+    assert.equal(evaluateReadPolicy(input), "prompt");
+    assert.equal(evaluateReadPolicy({ ...input, allowRead: [link] }), "allow");
+  } finally {
+    rmSync(container, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
 });
 
 test("recursive checks discover hard-denied descendants", () => {
