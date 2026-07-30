@@ -102,7 +102,7 @@ macOS does not use `apply-seccomp`; Seatbelt enforces Unix-socket restrictions t
 
 ## Policy version 2
 
-A simple configuration can live in trusted global configuration at `~/.pi/agent/sandbox.json` or in trusted project configuration at `.pi/sandbox.json`:
+A simple direct policy can live in trusted global configuration at `~/.pi/agent/sandbox.json`:
 
 ```json
 {
@@ -145,16 +145,50 @@ V2 filesystem rules support literal paths and trailing `/**` subtree notation. O
 
 Policies always use version 2 semantics. The `policyVersion` field may be omitted; if present, it must be `2`. Filesystem paths must be literals or use trailing `/**` subtree notation.
 
-## Configuration trust and grants
+## Configuration trust, project requests, and grants
+
+Allow fields have source-dependent authority:
+
+| Source | Meaning of allow fields |
+|---|---|
+| Built-in and global policy | Direct grant |
+| Trusted project `.pi/sandbox*.json` | Request requiring user approval |
+| User-owned project grant | Direct, previously approved grant |
+| In-memory session allowance | Direct session grant |
+
+A trusted project can declare reproducible access needs using the existing fields:
+
+```json
+{
+  "policyVersion": 2,
+  "network": {
+    "allowedDomains": ["packages.example.internal"],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "allowRead": ["../shared-sdk"],
+    "allowWrite": ["~/.cache/example-build"],
+    "denyRead": [".env"],
+    "denyWrite": [".github/workflows"]
+  }
+}
+```
+
+Project `allowRead`, `allowWrite`, and `allowedDomains` entries are reviewed before sandbox startup. Trust permits loading this declaration but does not approve it. Project deny entries apply immediately because they only restrict access. External paths are valid requests; they are not silently granted or discarded. Project wildcard domain requests and powerful controls remain rejected.
+
+Pi does not normally treat `.pi/sandbox*.json` alone as a trust-triggering resource. When this package is loaded as a user/global or CLI extension, it participates in Pi's `project_trust` event so a sandbox-only project can be trusted explicitly. If other trust-triggering Pi resources are present, it defers to Pi's built-in trust flow.
+
+Approved declared requests are stored in `~/.pi/agent/sandbox-projects/<project-id>[.<mode>].requests.json`, keyed by canonical project path and mode. An expanded request prompts again, while a removed request stops contributing declared access. Non-interactive sessions never auto-approve pending requests and continue with them blocked.
+
+Reactive “Allow for this project” grants remain separate in `<project-id>[.<mode>].json`. They support dynamic or undeclared needs and remain direct user-owned grants even if a project declaration later changes.
 
 - Project `.pi/sandbox*.json` is used only when Pi reports the project trusted.
-- Project configuration cannot disable the sandbox, request wildcard network access, or grant filesystem access outside the canonical project root.
 - Session grants remain in memory.
-- “Allow for this project” grants are stored under `~/.pi/agent/sandbox-projects/`, keyed by canonical project path—not in the agent-writable repository.
-- Active global, project, mode, and grant policy files are write-protected from model tools and sandboxed bash.
+- Active global, project, mode, reactive-grant, and request-approval files are write-protected from model tools and sandboxed bash.
+- `/sandbox` reports project requests, their sources and statuses, declared approvals, and reactive grants separately.
 - Policy is validated and snapshotted. It is not reread before every tool call.
 
-Global configuration is the place for powerful controls such as `filesystem.disabled`, wildcard domains, Unix socket access, Apple Events, or weaker isolation flags. `enableWeakerNetworkIsolation` is false by default.
+Global configuration is the place for powerful controls such as `filesystem.disabled`, wildcard domains, Unix socket access, Apple Events, or weaker isolation flags. `enableWeakerNetworkIsolation` is false by default. Global hard denies and active mode denies remain authoritative over project approvals; no global delegation setting is required.
 
 ## Tool behavior
 

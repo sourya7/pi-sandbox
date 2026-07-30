@@ -1,6 +1,12 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
+import {
+  type ClassifiedDomainRequest,
+  type ClassifiedPathRequest,
+  type ProjectRequestSelection,
+  type ProjectRequestState,
+} from "./access-requests.ts";
 import { type LoadedSandboxPolicy, type SandboxConfig } from "./config.ts";
 import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
@@ -155,6 +161,94 @@ export function promptAccessRequest(
   );
 }
 
+export type ProjectAccessReviewResult =
+  | { action: "continue"; approved: ProjectRequestSelection }
+  | { action: "abort"; approved: ProjectRequestSelection };
+
+const emptyProjectSelection = (): ProjectRequestSelection => ({
+  read: [],
+  write: [],
+  network: [],
+});
+
+export function formatProjectAccessRequestSummary(
+  state: ProjectRequestState,
+  onlyPending = true,
+): string {
+  const include = (status: string) => !onlyPending || status === "pending";
+  const read = state.readPaths.filter((entry) => include(entry.status));
+  const write = state.writePaths.filter((entry) => include(entry.status));
+  const network = state.domains.filter((entry) => include(entry.status));
+  const lines = ["This project requests additional sandbox access:"];
+  if (read.length) lines.push("", "Read:", ...read.map((entry) => `  ${entry.canonicalPath}`));
+  if (write.length) {
+    lines.push(
+      "",
+      "Write (also grants read):",
+      ...write.map((entry) => `  ${entry.canonicalPath}`),
+    );
+  }
+  if (network.length) lines.push("", "Network:", ...network.map((entry) => `  ${entry.domain}`));
+  return lines.join("\n");
+}
+
+export async function promptProjectAccessRequests(
+  ctx: ExtensionContext,
+  state: ProjectRequestState,
+): Promise<ProjectAccessReviewResult> {
+  const empty = emptyProjectSelection();
+  if (!ctx.hasUI && ctx.mode !== "rpc") return { action: "continue", approved: empty };
+
+  const summary = formatProjectAccessRequestSummary(state);
+  const options = [
+    "Approve all for this project",
+    "Review individually",
+    "Continue with requests blocked",
+    "Abort session startup",
+  ];
+  const choice = await ctx.ui.select(summary, options);
+  if (choice === options[3]) return { action: "abort", approved: empty };
+  if (choice === options[2] || !choice) return { action: "continue", approved: empty };
+
+  const pendingRead = state.readPaths.filter((entry) => entry.status === "pending");
+  const pendingWrite = state.writePaths.filter((entry) => entry.status === "pending");
+  const pendingNetwork = state.domains.filter((entry) => entry.status === "pending");
+  if (choice === options[0]) {
+    const confirmed = await ctx.ui.select(
+      `${summary}\n\nPersist these approvals in the user-owned project approval file?`,
+      ["Confirm approval", "Cancel"],
+    );
+    if (confirmed !== "Confirm approval") return { action: "continue", approved: empty };
+    return {
+      action: "continue",
+      approved: {
+        read: pendingRead.map((entry) => entry.canonicalPath),
+        write: pendingWrite.map((entry) => entry.canonicalPath),
+        network: pendingNetwork.map((entry) => entry.domain),
+      },
+    };
+  }
+
+  const approved = emptyProjectSelection();
+  const review = async (label: string, value: string): Promise<boolean> =>
+    (await ctx.ui.select(`Approve project ${label} access?\n\n${value}`, [
+      "Approve",
+      "Keep blocked",
+    ])) === "Approve";
+  for (const entry of pendingRead) {
+    if (await review("read", entry.canonicalPath)) approved.read.push(entry.canonicalPath);
+  }
+  for (const entry of pendingWrite) {
+    if (await review("write (also read)", entry.canonicalPath)) {
+      approved.write.push(entry.canonicalPath);
+    }
+  }
+  for (const entry of pendingNetwork) {
+    if (await review("network", entry.domain)) approved.network.push(entry.domain);
+  }
+  return { action: "continue", approved };
+}
+
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
   if (!allowsAllDomains(config.network?.allowedDomains)) return;
   ctx.ui.notify(
@@ -184,12 +278,55 @@ export function formatSandboxStatus(
   return `🔒 Sandbox: ${mode} · read ${scope} · ${writeLabel} · ${networkLabel}`;
 }
 
+function formatPathRequest(entry: ClassifiedPathRequest): string[] {
+  const configured = entry.configuredValues.join(", ");
+  const spelling = entry.configuredValues.includes(entry.canonicalPath)
+    ? entry.canonicalPath
+    : `${configured} -> ${entry.canonicalPath}`;
+  return [
+    `    ${spelling}`,
+    `      status: ${entry.status}`,
+    `      source: ${entry.sources.map((source) => source.sourcePath).join(", ")}`,
+  ];
+}
+
+function formatDomainRequest(entry: ClassifiedDomainRequest): string[] {
+  return [
+    `    ${entry.domain}`,
+    `      status: ${entry.status}`,
+    `      source: ${entry.sources.map((source) => source.sourcePath).join(", ")}`,
+  ];
+}
+
+function formatProjectRequestDiagnostics(state?: ProjectRequestState): string[] {
+  if (!state) return ["Project policy requests: (not classified)"];
+  const lines = [
+    "Project policy requests:",
+    `  Manifest: ${state.manifestHash}`,
+    `  Approved at: ${state.approval?.approvedAt ?? "(no approval record)"}`,
+  ];
+  if (state.readPaths.length) {
+    lines.push("  Read:", ...state.readPaths.flatMap(formatPathRequest));
+  }
+  if (state.writePaths.length) {
+    lines.push("  Write:", ...state.writePaths.flatMap(formatPathRequest));
+  }
+  if (state.domains.length) {
+    lines.push("  Network:", ...state.domains.flatMap(formatDomainRequest));
+  }
+  if (!state.readPaths.length && !state.writePaths.length && !state.domains.length) {
+    lines.push("  (none)");
+  }
+  return lines;
+}
+
 export function formatSandboxConfiguration(
   loaded: LoadedSandboxPolicy,
   allowances: SessionAllowances,
   mode = DEFAULT_MODE,
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
   bootstrapReadPaths: string[] = [],
+  projectRequestState?: ProjectRequestState,
 ): string {
   const { config, paths } = loaded;
   const modePolicy = getModePolicy(mode);
@@ -210,10 +347,15 @@ export function formatSandboxConfiguration(
     `  Global mode:  ${paths.globalModePath ?? "(none)"}`,
     `  Project base: ${paths.projectBasePath}`,
     `  Project mode: ${paths.projectModePath ?? "(none)"}`,
-    `  Project grants (user-owned): ${paths.projectGrantPath}`,
+    `  Reactive project grants (user-owned): ${paths.projectGrantPath}`,
+    `  Declared request approvals: ${paths.projectRequestApprovalPath}`,
+    "",
+    ...formatProjectRequestDiagnostics(projectRequestState),
     "",
     "Network (sandboxed bash + !cmd):",
-    `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
+    `  Direct global/default allowed: ${loaded.directConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
+    `  Reactive project allowed: ${loaded.reactiveProjectGrant?.network?.allowedDomains?.join(", ") || "(none)"}`,
+    `  Effective allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
     ...(allowsAllDomains(config.network?.allowedDomains)
       ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
       : []),
@@ -222,8 +364,12 @@ export function formatSandboxConfiguration(
     "",
     "Filesystem:",
     `  Hard deny read: ${config.filesystem.denyRead.join(", ") || "(none)"}`,
-    `  Allow read:     ${config.filesystem.allowRead?.join(", ") || "(none)"}`,
-    `  Allow write:    ${config.filesystem.allowWrite.join(", ") || "(none)"}`,
+    `  Direct global/default read:  ${loaded.directConfig.filesystem.allowRead?.join(", ") || "(none)"}`,
+    `  Direct global/default write: ${loaded.directConfig.filesystem.allowWrite.join(", ") || "(none)"}`,
+    `  Reactive project read:  ${loaded.reactiveProjectGrant?.filesystem?.allowRead?.join(", ") || "(none)"}`,
+    `  Reactive project write: ${loaded.reactiveProjectGrant?.filesystem?.allowWrite?.join(", ") || "(none)"}`,
+    `  Effective allow read:  ${config.filesystem.allowRead?.join(", ") || "(none)"}`,
+    `  Effective allow write: ${config.filesystem.allowWrite.join(", ") || "(none)"}`,
     "  Implicit read:  every allowWrite path (except hard-denied descendants)",
     `  Bootstrap read: ${[...new Set(bootstrapReadPaths)].join(", ") || "(none)"}`,
     `  Deny write:     ${config.filesystem.denyWrite.join(", ") || "(none)"}`,

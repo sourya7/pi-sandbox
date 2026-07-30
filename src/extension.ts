@@ -1,5 +1,12 @@
+import { existsSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  type AgentToolResult,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
   isToolCallEventType,
@@ -8,11 +15,20 @@ import {
 import { Type } from "typebox";
 
 import {
+  approvedSelectionFromState,
+  classifyProjectAccessRequests,
+  declaredProjectAllowances,
+  pendingProjectRequestCount,
+  type ProjectRequestSelection,
+  type ProjectRequestState,
+} from "./access-requests.ts";
+import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
   loadPolicy,
   type LoadedSandboxPolicy,
+  writeProjectRequestApproval,
 } from "./config.ts";
 import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import {
@@ -38,6 +54,7 @@ import {
   type PermissionChoice,
   promptAccessRequest,
   promptDomainBlock,
+  promptProjectAccessRequests,
   promptReadBlock,
   promptWriteBlock,
   warnIfAllDomainsAllowed,
@@ -61,6 +78,38 @@ function textResult(text: string): AgentToolResult<Record<string, never>> {
 type SandboxState = "disabled-by-user" | "initializing" | "active" | "failed";
 type GrantKind = "domain" | "read" | "write";
 
+export function hasProjectSandboxDeclaration(cwd: string): boolean {
+  const configDirectory = join(cwd, CONFIG_DIR_NAME);
+  if (!existsSync(configDirectory)) return false;
+  try {
+    return readdirSync(configDirectory).some((name) => /^sandbox(?:\..+)?\.json$/.test(name));
+  } catch {
+    return false;
+  }
+}
+
+export function hasOtherProjectTrustResources(cwd: string): boolean {
+  const configDirectory = join(cwd, CONFIG_DIR_NAME);
+  const localResources = [
+    "settings.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+  ];
+  if (localResources.some((name) => existsSync(join(configDirectory, name)))) return true;
+
+  let current = cwd;
+  while (true) {
+    if (existsSync(join(current, ".agents", "skills"))) return true;
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -73,6 +122,24 @@ export default function (pi: ExtensionAPI) {
     default: DEFAULT_MODE,
   });
 
+  pi.on("project_trust", async (event, ctx) => {
+    if (
+      !hasProjectSandboxDeclaration(event.cwd) ||
+      hasOtherProjectTrustResources(event.cwd) ||
+      !ctx.hasUI
+    ) {
+      return { trusted: "undecided" };
+    }
+    const choice = await ctx.ui.select(
+      `This project declares sandbox restrictions and access requests. Trust permits loading the declaration; it does not approve requested access.\n\n${event.cwd}`,
+      ["Trust and remember", "Trust for this process", "Do not trust and remember", "Cancel"],
+    );
+    if (choice === "Trust and remember") return { trusted: "yes", remember: true };
+    if (choice === "Trust for this process") return { trusted: "yes" };
+    if (choice === "Do not trust and remember") return { trusted: "no", remember: true };
+    return { trusted: "undecided" };
+  });
+
   const localCwd = process.cwd();
   const userShellPath = SettingsManager.create(localCwd).getShellPath();
   const bootstrapShellPaths = userShellPath ? [userShellPath] : [];
@@ -81,6 +148,7 @@ export default function (pi: ExtensionAPI) {
   let state: SandboxState = "initializing";
   let activeMode = DEFAULT_MODE;
   let policy: LoadedSandboxPolicy | undefined;
+  let projectRequestState: ProjectRequestState | undefined;
   const allowancesByMode = new Map<string, SessionAllowances>();
   const pendingDomainPrompts = new Map<string, Promise<boolean>>();
   let activeCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
@@ -125,8 +193,87 @@ export default function (pi: ExtensionAPI) {
   ): LoadedSandboxPolicy {
     const loaded = loadPolicy(ctx.cwd, activeMode, ctx.isProjectTrusted());
     policy = loaded;
+    projectRequestState = classifyProjectAccessRequests({
+      requests: loaded.projectRequests,
+      config: loaded.config,
+      projectRoot: loaded.projectRoot,
+      mode: activeMode,
+      modePolicy: getModePolicy(activeMode),
+      protectedWritePaths: loaded.protectedWritePaths,
+      approval: loaded.projectRequestApproval,
+    });
     for (const warning of loaded.warnings) ctx.ui.notify(`Sandbox policy: ${warning}`, "warning");
     return loaded;
+  }
+
+  function emptySelection(): ProjectRequestSelection {
+    return { read: [], write: [], network: [] };
+  }
+
+  function hasSelection(selection: ProjectRequestSelection): boolean {
+    return selection.read.length + selection.write.length + selection.network.length > 0;
+  }
+
+  function reclassifyProjectRequests(loaded: LoadedSandboxPolicy): ProjectRequestState {
+    projectRequestState = classifyProjectAccessRequests({
+      requests: loaded.projectRequests,
+      config: loaded.config,
+      projectRoot: loaded.projectRoot,
+      mode: activeMode,
+      modePolicy: getModePolicy(activeMode),
+      protectedWritePaths: loaded.protectedWritePaths,
+      approval: loaded.projectRequestApproval,
+    });
+    return projectRequestState;
+  }
+
+  async function reviewProjectRequests(
+    loaded: LoadedSandboxPolicy,
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+  ): Promise<boolean> {
+    let requestState = reclassifyProjectRequests(loaded);
+    const pending = pendingProjectRequestCount(requestState);
+    let newlyApproved = emptySelection();
+    if (pending > 0) {
+      if (!ctx.hasUI && ctx.mode !== "rpc") {
+        ctx.ui.notify(
+          `Project sandbox policy has ${pending} pending access request(s); non-interactive sessions never auto-approve them.`,
+          "warning",
+        );
+      }
+      const review = await promptProjectAccessRequests(ctx, requestState);
+      if (review.action === "abort") return false;
+      newlyApproved = review.approved;
+    }
+
+    const approved = approvedSelectionFromState(requestState, newlyApproved);
+    const needsWrite =
+      hasSelection(newlyApproved) ||
+      (loaded.projectRequestApproval !== undefined &&
+        loaded.projectRequestApproval.manifestHash !== requestState.manifestHash);
+    if (needsWrite) {
+      try {
+        loaded.projectRequestApproval = writeProjectRequestApproval(
+          loaded.paths.projectRequestApprovalPath,
+          loaded.projectRoot,
+          activeMode,
+          loaded.projectRequests,
+          approved,
+        );
+        requestState = reclassifyProjectRequests(loaded);
+      } catch (error) {
+        ctx.ui.notify(
+          `Could not persist project access approval; requested access remains blocked: ${error}`,
+          "error",
+        );
+        reclassifyProjectRequests(loaded);
+      }
+    }
+    return true;
+  }
+
+  function declaredAllowances(): SessionAllowances {
+    return projectRequestState ? declaredProjectAllowances(projectRequestState) : newAllowances();
   }
 
   function effectiveReadPaths(): string[] {
@@ -138,6 +285,8 @@ export default function (pi: ExtensionAPI) {
         ...config.filesystem.allowWrite,
         ...getModeAllowances().readPaths,
         ...getModeAllowances().writePaths,
+        ...declaredAllowances().readPaths,
+        ...declaredAllowances().writePaths,
       ],
       activeCtx?.cwd ?? localCwd,
     );
@@ -147,7 +296,11 @@ export default function (pi: ExtensionAPI) {
     if (getModePolicy(activeMode).write === "deny") return [];
     const loaded = requirePolicy();
     return resolvePolicyPatterns(
-      [...loaded.config.filesystem.allowWrite, ...getModeAllowances().writePaths],
+      [
+        ...loaded.config.filesystem.allowWrite,
+        ...getModeAllowances().writePaths,
+        ...declaredAllowances().writePaths,
+      ],
       activeCtx?.cwd ?? localCwd,
     );
   }
@@ -162,7 +315,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   function runtimeAllowancesForActiveMode(): SessionAllowances {
-    const allowances = getModeAllowances();
+    const session = getModeAllowances();
+    const declared = declaredAllowances();
+    const allowances = {
+      domains: [...new Set([...session.domains, ...declared.domains])],
+      readPaths: [...new Set([...session.readPaths, ...declared.readPaths])],
+      writePaths: [...new Set([...session.writePaths, ...declared.writePaths])],
+    };
     return getModePolicy(activeMode).write === "deny"
       ? { ...allowances, writePaths: [] }
       : allowances;
@@ -299,6 +458,7 @@ export default function (pi: ExtensionAPI) {
     const allowed = [
       ...(loaded.config.network.allowedDomains ?? []),
       ...getModeAllowances().domains,
+      ...declaredAllowances().domains,
     ];
     if (domainIsAllowed(host, allowed)) return true;
     const existing = pendingDomainPrompts.get(host);
@@ -565,6 +725,12 @@ export default function (pi: ExtensionAPI) {
         updateStatus(ctx);
         return;
       }
+      if (!(await reviewProjectRequests(loaded, ctx))) {
+        state = "failed";
+        ctx.ui.notify("Sandbox startup aborted while reviewing project access requests", "warning");
+        updateStatus(ctx);
+        return;
+      }
       await startSandbox(ctx, true);
     } catch (error) {
       state = "failed";
@@ -585,8 +751,11 @@ export default function (pi: ExtensionAPI) {
     description: "Enable the sandbox for this session",
     handler: async (_args, ctx) => {
       try {
-        loadPolicySnapshot(ctx);
         if (state === "active") return void ctx.ui.notify("Sandbox is already enabled", "info");
+        const loaded = loadPolicySnapshot(ctx);
+        if (!(await reviewProjectRequests(loaded, ctx))) {
+          return void ctx.ui.notify("Sandbox enable aborted during access review", "warning");
+        }
         if (await startSandbox(ctx, false)) ctx.ui.notify("Sandbox enabled", "info");
       } catch (error) {
         state = "failed";
@@ -613,14 +782,19 @@ export default function (pi: ExtensionAPI) {
       await serialize(async () => {
         const previousMode = activeMode;
         const previousPolicy = policy;
+        const previousRequestState = projectRequestState;
         activeMode = requestedMode;
         try {
-          loadPolicySnapshot(ctx);
+          const loaded = loadPolicySnapshot(ctx);
+          if (!(await reviewProjectRequests(loaded, ctx))) {
+            throw new Error("mode switch aborted during project access review");
+          }
           if (state === "active") await refreshSandbox(ctx.cwd);
           updateStatus(ctx);
         } catch (error) {
           activeMode = previousMode;
           policy = previousPolicy;
+          projectRequestState = previousRequestState;
           throw error;
         }
       });
@@ -660,10 +834,20 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (!policy) return void ctx.ui.notify(`Sandbox is ${state}`, "info");
       ctx.ui.notify(
-        formatSandboxConfiguration(policy, getModeAllowances(), activeMode, state, [
-          ...getRuntimeBootstrapReadPaths(ctx.cwd, policy.config.filesystem.readScope === "strict"),
-          ...bootstrapShellPaths,
-        ]),
+        formatSandboxConfiguration(
+          policy,
+          getModeAllowances(),
+          activeMode,
+          state,
+          [
+            ...getRuntimeBootstrapReadPaths(
+              ctx.cwd,
+              policy.config.filesystem.readScope === "strict",
+            ),
+            ...bootstrapShellPaths,
+          ],
+          projectRequestState,
+        ),
         "info",
       );
     },

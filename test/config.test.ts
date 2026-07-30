@@ -1,4 +1,11 @@
-import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -10,9 +17,10 @@ import {
   deepMerge,
   DEFAULT_CONFIG,
   getConfigPaths,
-  loadConfig,
   loadPolicy,
+  readProjectRequestApproval,
   validateConfig,
+  writeProjectRequestApproval,
 } from "../src/config.ts";
 
 test("deepMerge merges sections while adding configured arrays", () => {
@@ -87,30 +95,48 @@ test("getConfigPaths includes mode-specific files for named modes", () => {
     projectBasePath: join(cwd, ".pi", "sandbox.json"),
     projectModePath: join(cwd, ".pi", "sandbox.read-only.json"),
     projectGrantPath: paths.projectGrantPath,
+    projectRequestApprovalPath: paths.projectRequestApprovalPath,
   });
+  assert.match(
+    paths.projectRequestApprovalPath,
+    /sandbox-projects\/.+\.read-only\.requests\.json$/,
+  );
   assert.match(paths.projectGrantPath, /sandbox-projects\/.+\.read-only\.json$/);
 });
 
-test("loadConfig named mode adds project base and project mode arrays", () => {
+test("loadPolicy extracts project base and mode allows as requests", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
     join(cwd, ".pi", "sandbox.json"),
-    JSON.stringify({ filesystem: { allowRead: ["project-base"], denyWrite: ["base.key"] } }),
+    JSON.stringify({
+      network: { allowedDomains: ["project.example"], deniedDomains: ["blocked.example"] },
+      filesystem: { allowRead: ["project-base"], denyWrite: ["base.key"] },
+    }),
   );
   writeFileSync(
     join(cwd, ".pi", "sandbox.read-only.json"),
     JSON.stringify({ filesystem: { allowRead: ["project-mode"], denyWrite: ["mode.key"] } }),
   );
 
-  const config = loadConfig(cwd, "read-only");
-  assert.equal(config.policyVersion, 2);
-  assert.equal(config.filesystem.readScope, "home");
-  assert.equal(config.filesystem?.allowRead?.includes("."), true);
-  assert.equal(config.filesystem?.allowRead?.includes("project-base"), true);
-  assert.equal(config.filesystem?.allowRead?.includes("project-mode"), true);
-  assert.equal(config.filesystem?.denyWrite?.includes("base.key"), true);
-  assert.equal(config.filesystem?.denyWrite?.includes("mode.key"), true);
+  const loaded = loadPolicy(cwd, "read-only", true);
+  assert.equal(loaded.config.policyVersion, 2);
+  assert.equal(loaded.config.filesystem.readScope, "home");
+  assert.equal(loaded.config.filesystem.allowRead?.includes("."), true);
+  assert.equal(loaded.config.filesystem.allowRead?.includes("project-base"), false);
+  assert.equal(loaded.config.filesystem.allowRead?.includes("project-mode"), false);
+  assert.deepEqual(
+    loaded.projectRequests.readPaths.map((request) => request.canonicalPath),
+    [join(cwd, "project-base"), join(cwd, "project-mode")],
+  );
+  assert.equal(loaded.config.filesystem.denyWrite.includes("base.key"), true);
+  assert.equal(loaded.config.filesystem.denyWrite.includes("mode.key"), true);
+  assert.equal(loaded.config.network?.allowedDomains?.includes("project.example"), false);
+  assert.equal(loaded.config.network?.deniedDomains?.includes("blocked.example"), true);
+  assert.deepEqual(
+    loaded.projectRequests.domains.map((request) => request.domain),
+    ["project.example"],
+  );
 });
 
 test("untrusted project policy is not loaded", () => {
@@ -127,21 +153,77 @@ test("untrusted project policy is not loaded", () => {
   assert.equal(loaded.projectTrusted, false);
 });
 
-test("trusted project cannot grant paths outside the project or disable sandbox", () => {
+test("trusted project external allows become requests and powerful controls are ignored", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-project-trust-"));
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
     join(cwd, ".pi", "sandbox.json"),
     JSON.stringify({
       enabled: false,
-      filesystem: { allowRead: ["/etc"], allowWrite: ["/tmp/out"], denyRead: [], denyWrite: [] },
+      filesystem: { allowRead: ["/etc"], allowWrite: ["/var/out"], denyRead: [], denyWrite: [] },
     }),
   );
   const loaded = loadPolicy(cwd, "default", true);
   assert.notEqual(loaded.config.enabled, false);
   assert.equal(loaded.config.filesystem.allowRead?.includes("/etc"), false);
-  assert.equal(loaded.config.filesystem.allowWrite.includes("/tmp/out"), false);
-  assert.equal(loaded.warnings.length >= 2, true);
+  assert.equal(loaded.config.filesystem.allowWrite.includes("/var/out"), false);
+  assert.deepEqual(
+    loaded.projectRequests.readPaths.map((request) => request.canonicalPath),
+    ["/etc"],
+  );
+  assert.deepEqual(
+    loaded.projectRequests.writePaths.map((request) => request.canonicalPath),
+    ["/var/out"],
+  );
+  assert.match(loaded.warnings.join("\n"), /Ignored unsupported project controls: enabled/);
+});
+
+test("project wildcard domain request is rejected", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-project-domain-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "sandbox.json"),
+    JSON.stringify({ network: { allowedDomains: ["*"] } }),
+  );
+  assert.throws(() => loadPolicy(cwd, "default", true), /cannot contain/);
+});
+
+test("request approvals are mode/root-bound and safely persisted", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-approval-"));
+  const path = join(cwd, "approvals", "request.json");
+  const requests = { readPaths: [], writePaths: [], domains: [] };
+  const written = writeProjectRequestApproval(path, cwd, "build", requests, {
+    read: ["/read"],
+    write: ["/write"],
+    network: ["example.com"],
+  });
+  const warnings: string[] = [];
+  assert.deepEqual(readProjectRequestApproval(path, cwd, "build", warnings), written);
+  assert.deepEqual(warnings, []);
+  assert.equal((lstatSync(path).mode & 0o777).toString(8), "600");
+
+  const wrongModeWarnings: string[] = [];
+  assert.equal(readProjectRequestApproval(path, cwd, "default", wrongModeWarnings), undefined);
+  assert.match(wrongModeWarnings.join("\n"), /mode does not match/);
+});
+
+test("request approval writer refuses symlinked approval directories", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-approval-link-"));
+  const realDirectory = join(cwd, "real");
+  const linkedDirectory = join(cwd, "linked");
+  mkdirSync(realDirectory);
+  symlinkSync(realDirectory, linkedDirectory);
+  assert.throws(
+    () =>
+      writeProjectRequestApproval(
+        join(linkedDirectory, "request.json"),
+        cwd,
+        "default",
+        { readPaths: [], writePaths: [], domains: [] },
+        { read: [], write: [], network: [] },
+      ),
+    /symlinked approval directory/,
+  );
 });
 
 test("grant writers create version 2 policy files", () => {
