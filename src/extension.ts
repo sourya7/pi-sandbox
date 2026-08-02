@@ -78,6 +78,16 @@ function textResult(text: string): AgentToolResult<Record<string, never>> {
 type SandboxState = "disabled-by-user" | "initializing" | "active" | "failed";
 type GrantKind = "domain" | "read" | "write";
 
+interface ReviewLifecycle {
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+}
+
+interface DeferredStartup {
+  controller: AbortController;
+  task: Promise<void>;
+}
+
 export function hasProjectSandboxDeclaration(cwd: string): boolean {
   const configDirectory = join(cwd, CONFIG_DIR_NAME);
   if (!existsSync(configDirectory)) return false;
@@ -155,6 +165,7 @@ export default function (pi: ExtensionAPI) {
   let activeToolCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
   let mutationTail: Promise<void> = Promise.resolve();
   let bashTail: Promise<void> = Promise.resolve();
+  let deferredStartup: DeferredStartup | undefined;
 
   function serialize<T>(operation: () => Promise<T>): Promise<T> {
     const run = mutationTail.then(operation, operation);
@@ -230,6 +241,7 @@ export default function (pi: ExtensionAPI) {
   async function reviewProjectRequests(
     loaded: LoadedSandboxPolicy,
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    lifecycle?: ReviewLifecycle,
   ): Promise<boolean> {
     let requestState = reclassifyProjectRequests(loaded);
     const pending = pendingProjectRequestCount(requestState);
@@ -241,7 +253,8 @@ export default function (pi: ExtensionAPI) {
           "warning",
         );
       }
-      const review = await promptProjectAccessRequests(ctx, requestState);
+      const review = await promptProjectAccessRequests(ctx, requestState, lifecycle?.signal);
+      if (lifecycle && !lifecycle.isCurrent()) return false;
       if (review.action === "abort") return false;
       newlyApproved = review.approved;
     }
@@ -252,6 +265,7 @@ export default function (pi: ExtensionAPI) {
       (loaded.projectRequestApproval !== undefined &&
         loaded.projectRequestApproval.manifestHash !== requestState.manifestHash);
     if (needsWrite) {
+      if (lifecycle && !lifecycle.isCurrent()) return false;
       try {
         loaded.projectRequestApproval = writeProjectRequestApproval(
           loaded.paths.projectRequestApprovalPath,
@@ -707,10 +721,69 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  async function cancelDeferredStartup(): Promise<void> {
+    const pending = deferredStartup;
+    if (!pending) return;
+    pending.controller.abort();
+    await pending.task;
+    if (deferredStartup === pending) deferredStartup = undefined;
+  }
+
+  function deferRpcStartup(
+    loaded: LoadedSandboxPolicy,
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+  ): void {
+    const controller = new AbortController();
+    let pending!: DeferredStartup;
+    const isCurrent = () => deferredStartup === pending && !controller.signal.aborted;
+    const nextEventLoopCycle = new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearImmediate(immediate);
+        controller.signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const immediate = setImmediate(finish);
+      controller.signal.addEventListener("abort", finish, { once: true });
+    });
+    const task = (async () => {
+      await nextEventLoopCycle;
+      if (!isCurrent()) return;
+      try {
+        if (!(await reviewProjectRequests(loaded, ctx, { signal: controller.signal, isCurrent }))) {
+          if (!isCurrent()) return;
+          state = "failed";
+          ctx.ui.notify(
+            "Sandbox startup aborted while reviewing project access requests",
+            "warning",
+          );
+          updateStatus(ctx);
+          return;
+        }
+        if (!isCurrent()) return;
+        await startSandbox(ctx, true);
+      } catch (error) {
+        if (!isCurrent()) return;
+        state = "failed";
+        ctx.ui.notify(`Sandbox startup failed; tools are blocked: ${error}`, "error");
+        updateStatus(ctx);
+      }
+    })();
+    pending = { controller, task };
+    deferredStartup = pending;
+    void task.then(() => {
+      if (deferredStartup === pending) deferredStartup = undefined;
+    });
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    await cancelDeferredStartup();
     activeMode =
       ((pi.getFlag("sandbox-mode") as string | undefined) || DEFAULT_MODE).trim() || DEFAULT_MODE;
     activeCtx = ctx;
+    state = "initializing";
     try {
       const loaded = loadPolicySnapshot(ctx);
       if (pi.getFlag("no-sandbox") as boolean) {
@@ -723,6 +796,11 @@ export default function (pi: ExtensionAPI) {
         state = "disabled-by-user";
         ctx.ui.notify("Sandbox disabled via trusted user configuration", "warning");
         updateStatus(ctx);
+        return;
+      }
+      if (ctx.mode === "rpc") {
+        updateStatus(ctx);
+        deferRpcStartup(loaded, ctx);
         return;
       }
       if (!(await reviewProjectRequests(loaded, ctx))) {
@@ -739,6 +817,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    await cancelDeferredStartup();
     if (state !== "active") return;
     try {
       await SandboxManager.reset();
@@ -752,6 +831,9 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         if (state === "active") return void ctx.ui.notify("Sandbox is already enabled", "info");
+        if (state === "initializing") {
+          return void ctx.ui.notify("Sandbox initialization is already in progress", "info");
+        }
         const loaded = loadPolicySnapshot(ctx);
         if (!(await reviewProjectRequests(loaded, ctx))) {
           return void ctx.ui.notify("Sandbox enable aborted during access review", "warning");
@@ -767,6 +849,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("sandbox-disable", {
     description: "Explicitly disable the sandbox for this session",
     handler: async (_args, ctx) => {
+      await cancelDeferredStartup();
       if (state === "active") await SandboxManager.reset();
       state = "disabled-by-user";
       updateStatus(ctx);
@@ -779,6 +862,12 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const requestedMode = commandArgText(args);
       if (!requestedMode) return void ctx.ui.notify(`Active sandbox mode: ${activeMode}`, "info");
+      if (state === "initializing") {
+        return void ctx.ui.notify(
+          "Wait for sandbox initialization before changing mode",
+          "warning",
+        );
+      }
       await serialize(async () => {
         const previousMode = activeMode;
         const previousPolicy = policy;

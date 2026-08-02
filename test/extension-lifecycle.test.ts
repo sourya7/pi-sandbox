@@ -92,7 +92,7 @@ function createContext(
   projectRoot: string,
   options: {
     hasUI: boolean;
-    mode: "tui" | "json";
+    mode: "tui" | "json" | "rpc";
     selections?: string[];
     events: string[];
     notifications: string[];
@@ -164,6 +164,54 @@ test("session startup reviews and persists project requests before runtime initi
 
     await harness.commands.get("sandbox")?.handler("", ctx);
     assert.match(notifications.at(-1) ?? "", /status: previously-approved/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousNodeProxy === undefined) delete process.env.NODE_USE_ENV_PROXY;
+    else process.env.NODE_USE_ENV_PROXY = previousNodeProxy;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("RPC startup defers project review and blocks bash until initialization", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-lifecycle-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-lifecycle-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousNodeProxy = process.env.NODE_USE_ENV_PROXY;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writePolicies(projectRoot, agentDir, `rpc-${process.pid}`);
+  const events: string[] = [];
+  const notifications: string[] = [];
+  t.mock.method(SandboxManager, "initialize", async () => {
+    events.push("initialize");
+  });
+
+  try {
+    const harness = createExtensionHarness();
+    const ctx = createContext(projectRoot, {
+      hasUI: true,
+      mode: "rpc",
+      selections: ["Approve all for this project", "Confirm approval"],
+      events,
+      notifications,
+    });
+
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+    assert.equal(events.length, 0);
+
+    const userBash = harness.handlers.get("user_bash")?.[0];
+    assert.ok(userBash);
+    const blocked = (await userBash({ type: "user_bash", command: "pwd" }, ctx)) as any;
+    assert.equal(blocked.result.exitCode, 126);
+    assert.match(blocked.result.output, /sandbox state is initializing/);
+
+    const deadline = Date.now() + 2000;
+    while (!events.includes("initialize") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(events, ["select", "select", "initialize"]);
+    assert.equal(existsSync(getConfigPaths(projectRoot).projectRequestApprovalPath), true);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

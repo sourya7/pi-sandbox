@@ -195,6 +195,7 @@ export function formatProjectAccessRequestSummary(
 export async function promptProjectAccessRequests(
   ctx: ExtensionContext,
   state: ProjectRequestState,
+  signal?: AbortSignal,
 ): Promise<ProjectAccessReviewResult> {
   const empty = emptyProjectSelection();
   if (!ctx.hasUI && ctx.mode !== "rpc") return { action: "continue", approved: empty };
@@ -206,7 +207,7 @@ export async function promptProjectAccessRequests(
     "Continue with requests blocked",
     "Abort session startup",
   ];
-  const choice = await ctx.ui.select(summary, options);
+  const choice = await ctx.ui.select(summary, options, { signal });
   if (choice === options[3]) return { action: "abort", approved: empty };
   if (choice === options[2] || !choice) return { action: "continue", approved: empty };
 
@@ -217,6 +218,7 @@ export async function promptProjectAccessRequests(
     const confirmed = await ctx.ui.select(
       `${summary}\n\nPersist these approvals in the user-owned project approval file?`,
       ["Confirm approval", "Cancel"],
+      { signal },
     );
     if (confirmed !== "Confirm approval") return { action: "continue", approved: empty };
     return {
@@ -231,10 +233,11 @@ export async function promptProjectAccessRequests(
 
   const approved = emptyProjectSelection();
   const review = async (label: string, value: string): Promise<boolean> =>
-    (await ctx.ui.select(`Approve project ${label} access?\n\n${value}`, [
-      "Approve",
-      "Keep blocked",
-    ])) === "Approve";
+    (await ctx.ui.select(
+      `Approve project ${label} access?\n\n${value}`,
+      ["Approve", "Keep blocked"],
+      { signal },
+    )) === "Approve";
   for (const entry of pendingRead) {
     if (await review("read", entry.canonicalPath)) approved.read.push(entry.canonicalPath);
   }
