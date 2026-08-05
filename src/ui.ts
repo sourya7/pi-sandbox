@@ -11,6 +11,7 @@ import { type LoadedSandboxPolicy, type SandboxConfig } from "./config.ts";
 import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
+import { type ExactSessionOverride } from "./session-overrides.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
 
@@ -265,6 +266,7 @@ export function formatSandboxStatus(
   config: SandboxConfig,
   mode = DEFAULT_MODE,
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
+  exactOverrideCount = 0,
 ): string {
   if (state === "failed") return "⛔ Sandbox unavailable — tools blocked";
   if (state === "initializing") return "⏳ Sandbox initializing — tools blocked";
@@ -278,7 +280,10 @@ export function formatSandboxStatus(
       ? "writes denied"
       : `${config.filesystem.allowWrite.length} write paths`;
   const scope = config.filesystem.readScope ?? "home";
-  return `🔒 Sandbox: ${mode} · read ${scope} · ${writeLabel} · ${networkLabel}`;
+  const overrideLabel = exactOverrideCount
+    ? ` · ⚠️ ${exactOverrideCount} exact deny override${exactOverrideCount === 1 ? "" : "s"}`
+    : "";
+  return `🔒 Sandbox: ${mode}${overrideLabel} · read ${scope} · ${writeLabel} · ${networkLabel}`;
 }
 
 function formatPathRequest(entry: ClassifiedPathRequest): string[] {
@@ -330,6 +335,8 @@ export function formatSandboxConfiguration(
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
   bootstrapReadPaths: string[] = [],
   projectRequestState?: ProjectRequestState,
+  effectiveConfig: SandboxConfig = loaded.config,
+  exactOverrides: ExactSessionOverride[] = [],
 ): string {
   const { config, paths } = loaded;
   const modePolicy = getModePolicy(mode);
@@ -366,7 +373,8 @@ export function formatSandboxConfiguration(
     ...(allowances.domains.length ? [`  Session allowed: ${allowances.domains.join(", ")}`] : []),
     "",
     "Filesystem:",
-    `  Hard deny read: ${config.filesystem.denyRead.join(", ") || "(none)"}`,
+    `  Configured hard deny read: ${config.filesystem.denyRead.join(", ") || "(none)"}`,
+    `  Effective hard deny read:  ${effectiveConfig.filesystem.denyRead.join(", ") || "(none)"}`,
     `  Direct global/default read:  ${loaded.directConfig.filesystem.allowRead?.join(", ") || "(none)"}`,
     `  Direct global/default write: ${loaded.directConfig.filesystem.allowWrite.join(", ") || "(none)"}`,
     `  Reactive project read:  ${loaded.reactiveProjectGrant?.filesystem?.allowRead?.join(", ") || "(none)"}`,
@@ -375,13 +383,22 @@ export function formatSandboxConfiguration(
     `  Effective allow write: ${config.filesystem.allowWrite.join(", ") || "(none)"}`,
     "  Implicit read:  every allowWrite path (except hard-denied descendants)",
     `  Bootstrap read: ${[...new Set(bootstrapReadPaths)].join(", ") || "(none)"}`,
-    `  Deny write:     ${config.filesystem.denyWrite.join(", ") || "(none)"}`,
+    `  Configured deny write: ${config.filesystem.denyWrite.join(", ") || "(none)"}`,
+    `  Effective deny write:  ${effectiveConfig.filesystem.denyWrite.join(", ") || "(none)"}`,
     ...(allowances.readPaths.length
       ? [`  Session read:    ${allowances.readPaths.join(", ")}`]
       : []),
     ...(allowances.writePaths.length
       ? [`  Session write:   ${allowances.writePaths.join(", ")}`]
       : []),
+    "  Exact session deny overrides:",
+    ...(exactOverrides.length
+      ? exactOverrides.flatMap((override) => [
+          `    ${override.operation}: ${override.canonicalPath}`,
+          `      removed: ${override.removedRules.map((rule) => `${rule.field} ${rule.configuredValue}`).join(", ")}`,
+          "      lifetime: active mode and session only",
+        ])
+      : ["    (none)"]),
     `  Protected policy files: ${loaded.protectedWritePaths.join(", ")}`,
     "",
     "Isolation controls:",

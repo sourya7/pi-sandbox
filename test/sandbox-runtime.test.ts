@@ -14,6 +14,11 @@ import {
   filterDenyWriteForRuntime,
   supportsNodeEnvProxy,
 } from "../src/sandbox-runtime.ts";
+import {
+  deriveConfigWithExactOverrides,
+  overrideAllowances,
+  type ExactSessionOverride,
+} from "../src/session-overrides.ts";
 
 test("buildRuntimeConfig adds session allowances without mutating config", () => {
   const runtime = buildRuntimeConfig(DEFAULT_CONFIG, {
@@ -130,6 +135,40 @@ test("extractSandboxViolation classifies read, write, and network annotations", 
       raw: 'deny(1) network-outbound remote ip "example.com:443"',
     },
   );
+});
+
+test("exact override derivation removes only the selected runtime final deny", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-override-"));
+  const target = join(cwd, ".env");
+  const sibling = join(cwd, ".env.local");
+  const override: ExactSessionOverride = {
+    operation: "read",
+    configuredValue: ".env",
+    canonicalPath: target,
+    removedRules: [{ field: "denyRead", configuredValue: ".env" }],
+    createdAt: new Date(0).toISOString(),
+  };
+  const derived = deriveConfigWithExactOverrides(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem,
+        denyRead: [".env", ".env.local"],
+        allowRead: [],
+      },
+    },
+    [override],
+    cwd,
+  );
+  const paths = overrideAllowances([override]);
+  const runtime = buildRuntimeConfig(
+    derived,
+    { domains: [], readPaths: paths.readPaths, writePaths: paths.writePaths },
+    cwd,
+  );
+  assert.equal(runtime.filesystem.denyReadAlways?.includes(target), false);
+  assert.equal(runtime.filesystem.denyReadAlways?.includes(sibling), true);
+  assert.equal(runtime.filesystem.allowRead?.includes(target), true);
 });
 
 test("v2 runtime config maps user denyRead to authoritative final denies", () => {

@@ -216,6 +216,10 @@ Pi's built-in `grep` and `find` implementations spawn local `rg`/`fd` processes 
 /sandbox-allow-write <path>
 ```
 
+These commands always require a separate operator confirmation. In TUI mode Pi displays it directly; in RPC mode it emits an `extension_ui_request` with `method: "confirm"` for the trusted client (for example Emacs) to display and answer. JSON and print modes cannot authorize grants. The agent-facing `request_sandbox_access` tool cannot remove hard denies or initiate an exact-deny override.
+
+When the requested canonical path exactly matches a configured `denyRead` or `denyWrite` root, confirmation creates an in-memory override for the active mode and session: Pi derives an effective policy with only that exact rule removed and adds the path as a session allowance. Nested exceptions are intentionally rejected—for example, `~/.ssh/known_hosts` cannot be reopened beneath `denyRead: ["~/.ssh"]`—because removing the broader rule would expose more than requested. Credential rules, mode denies, policy/control files, and Sandbox Runtime mandatory write protections remain non-overridable. Use trusted user policy or `/sandbox-disable` explicitly when exact-match semantics are insufficient.
+
 ## Commands and modes
 
 ```text
@@ -225,8 +229,9 @@ pi --sandbox-mode read-only         start in a named mode
 /sandbox-mode [default|read-only|build]
 /sandbox-enable
 /sandbox-disable                    explicit visible bypass for the current session
-/sandbox-allow-read <path>
-/sandbox-allow-write <path>
+/sandbox-allow-read <path>          operator-confirmed session grant/exact deny override
+/sandbox-allow-write <path>         operator-confirmed session grant/exact deny override
+/sandbox-clear-overrides            clear exact deny overrides for the active mode
 ```
 
 | Mode | Read | Write | Network |

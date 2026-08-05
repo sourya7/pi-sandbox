@@ -12,12 +12,14 @@ import sandboxExtension from "../src/extension.ts";
 interface ExtensionHarness {
   handlers: Map<string, Array<(event: any, ctx: any) => Promise<unknown>>>;
   commands: Map<string, { handler: (args: unknown, ctx: any) => Promise<void> }>;
+  tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
   pi: any;
 }
 
 function createExtensionHarness(): ExtensionHarness {
   const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<unknown>>>();
   const commands = new Map<string, { handler: (args: unknown, ctx: any) => Promise<void> }>();
+  const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const flags = new Map<string, unknown>();
   const pi = {
     registerFlag(name: string, options: { default?: unknown }) {
@@ -31,7 +33,9 @@ function createExtensionHarness(): ExtensionHarness {
       registered.push(handler);
       handlers.set(name, registered);
     },
-    registerTool() {},
+    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }) {
+      tools.set(tool.name, tool);
+    },
     registerCommand(
       name: string,
       command: { handler: (args: unknown, ctx: any) => Promise<void> },
@@ -40,7 +44,7 @@ function createExtensionHarness(): ExtensionHarness {
     },
   };
   sandboxExtension(pi as any);
-  return { handlers, commands, pi };
+  return { handlers, commands, tools, pi };
 }
 
 async function emit(
@@ -94,6 +98,8 @@ function createContext(
     hasUI: boolean;
     mode: "tui" | "json" | "rpc";
     selections?: string[];
+    confirmations?: boolean[];
+    confirmationRequests?: Array<{ title: string; message: string; timeout?: number }>;
     events: string[];
     notifications: string[];
   },
@@ -115,7 +121,15 @@ function createContext(
         if (!selection) throw new Error("Unexpected lifecycle selection prompt");
         return selection;
       },
+      async confirm(title: string, message: string, dialog?: { timeout?: number }) {
+        options.events.push("confirm");
+        options.confirmationRequests?.push({ title, message, timeout: dialog?.timeout });
+        const confirmed = options.confirmations?.shift();
+        if (confirmed === undefined) throw new Error("Unexpected lifecycle confirmation prompt");
+        return confirmed;
+      },
     },
+    async waitForIdle() {},
   };
 }
 
@@ -217,6 +231,163 @@ test("RPC startup defers project review and blocks bash until initialization", a
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     if (previousNodeProxy === undefined) delete process.env.NODE_USE_ENV_PROXY;
     else process.env.NODE_USE_ENV_PROXY = previousNodeProxy;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("operator-confirmed exact overrides refresh, diagnose, and clear without agent initiation", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-override-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-override-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const target = join(projectRoot, ".env");
+  writeFileSync(
+    join(agentDir, "sandbox.json"),
+    JSON.stringify({
+      policyVersion: 2,
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        readScope: "strict",
+        denyRead: [".env"],
+        allowRead: [],
+        allowWrite: [projectRoot],
+        denyWrite: [".env"],
+      },
+    }),
+  );
+  const runtimeConfigs: SandboxRuntimeConfig[] = [];
+  let resetCount = 0;
+  t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+    runtimeConfigs.push(config);
+  });
+  t.mock.method(SandboxManager, "reset", async () => {
+    resetCount++;
+  });
+
+  const events: string[] = [];
+  const notifications: string[] = [];
+  const confirmationRequests: Array<{ title: string; message: string; timeout?: number }> = [];
+  try {
+    const harness = createExtensionHarness();
+    const ctx = createContext(projectRoot, {
+      hasUI: true,
+      mode: "tui",
+      confirmations: [true, false],
+      confirmationRequests,
+      events,
+      notifications,
+    });
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+    assert.equal(runtimeConfigs[0]?.filesystem.denyReadAlways?.includes(target), true);
+
+    const requestTool = harness.tools.get("request_sandbox_access");
+    assert.ok(requestTool);
+    const denied = await requestTool.execute(
+      "request-1",
+      { operation: "read", path: target, reason: "test" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(denied.content[0].text, /covered by denyRead/);
+    assert.equal(confirmationRequests.length, 0);
+
+    await harness.commands.get("sandbox-allow-read")?.handler(".env", ctx);
+    assert.equal(confirmationRequests.length, 1);
+    assert.equal(confirmationRequests[0].timeout, 60_000);
+    assert.match(confirmationRequests[0].message, /Path: .*\.env/);
+    assert.match(confirmationRequests[0].message, /denyRead \.env/);
+    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(target), false);
+    assert.equal(runtimeConfigs.at(-1)?.filesystem.allowRead?.includes(target), true);
+
+    await harness.commands.get("sandbox")?.handler("", ctx);
+    assert.match(notifications.at(-1) ?? "", /Exact session deny overrides:/);
+    assert.match(notifications.at(-1) ?? "", /removed: denyRead \.env/);
+
+    await harness.commands.get("sandbox-clear-overrides")?.handler("", ctx);
+    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(target), true);
+
+    const configCount = runtimeConfigs.length;
+    const resetsBeforeCancellation = resetCount;
+    await harness.commands.get("sandbox-allow-read")?.handler(".env", ctx);
+    assert.equal(runtimeConfigs.length, configCount);
+    assert.equal(resetCount, resetsBeforeCancellation);
+    assert.match(notifications.at(-1) ?? "", /cancelled/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("RPC can confirm an exact override while JSON mode fails closed", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-override-rpc-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-override-rpc-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(
+    join(agentDir, "sandbox.json"),
+    JSON.stringify({
+      policyVersion: 2,
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        readScope: "strict",
+        denyRead: [".env"],
+        allowRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }),
+  );
+  const runtimeConfigs: SandboxRuntimeConfig[] = [];
+  t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+    runtimeConfigs.push(config);
+  });
+  t.mock.method(SandboxManager, "reset", async () => undefined);
+
+  const events: string[] = [];
+  const notifications: string[] = [];
+  const confirmationRequests: Array<{ title: string; message: string; timeout?: number }> = [];
+  try {
+    const harness = createExtensionHarness();
+    const rpcCtx = createContext(projectRoot, {
+      hasUI: true,
+      mode: "rpc",
+      confirmations: [true],
+      confirmationRequests,
+      events,
+      notifications,
+    });
+    await emit(harness, "session_start", { reason: "startup" }, rpcCtx);
+    const deadline = Date.now() + 2000;
+    while (runtimeConfigs.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runtimeConfigs.length, 1);
+
+    await harness.commands.get("sandbox-allow-read")?.handler(".env", rpcCtx);
+    assert.equal(confirmationRequests.length, 1);
+    assert.equal(
+      runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(join(projectRoot, ".env")),
+      false,
+    );
+
+    await harness.commands.get("sandbox-clear-overrides")?.handler("", rpcCtx);
+    const jsonCtx = createContext(projectRoot, {
+      hasUI: false,
+      mode: "json",
+      events,
+      notifications,
+    });
+    const configCount = runtimeConfigs.length;
+    await harness.commands.get("sandbox-allow-read")?.handler(".env", jsonCtx);
+    assert.equal(runtimeConfigs.length, configCount);
+    assert.match(notifications.at(-1) ?? "", /require TUI or RPC confirmation/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     rmSync(projectRoot, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
   }

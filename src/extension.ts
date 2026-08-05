@@ -6,6 +6,7 @@ import {
   CONFIG_DIR_NAME,
   type AgentToolResult,
   type ExtensionAPI,
+  type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
@@ -39,6 +40,7 @@ import {
   matchesPattern,
   resolvePolicyPatterns,
 } from "./policy.ts";
+import { RuntimeLifecycleGate } from "./runtime-lifecycle.ts";
 import {
   buildRuntimeConfig,
   createSandboxedBashOps,
@@ -48,6 +50,15 @@ import {
   type SessionAllowances,
   supportsNodeEnvProxy,
 } from "./sandbox-runtime.ts";
+import {
+  canAuthorizeSessionGrant,
+  classifyExactSessionOverride,
+  deriveConfigWithExactOverrides,
+  formatSessionGrantConfirmation,
+  overrideAllowances,
+  type ExactOverrideClassification,
+  type ExactSessionOverride,
+} from "./session-overrides.ts";
 import {
   formatSandboxConfiguration,
   formatSandboxStatus,
@@ -160,11 +171,14 @@ export default function (pi: ExtensionAPI) {
   let policy: LoadedSandboxPolicy | undefined;
   let projectRequestState: ProjectRequestState | undefined;
   const allowancesByMode = new Map<string, SessionAllowances>();
+  const overridesByMode = new Map<string, ExactSessionOverride[]>();
   const pendingDomainPrompts = new Map<string, Promise<boolean>>();
   let activeCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
   let activeToolCtx: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
   let mutationTail: Promise<void> = Promise.resolve();
   let bashTail: Promise<void> = Promise.resolve();
+  const runtimeLifecycle = new RuntimeLifecycleGate();
+  let overrideConfirmationPending = false;
   let deferredStartup: DeferredStartup | undefined;
 
   function serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -185,6 +199,14 @@ export default function (pi: ExtensionAPI) {
     return run;
   }
 
+  function runSandboxChild<T>(operation: () => Promise<T>): Promise<T> {
+    return runtimeLifecycle.runChild(operation);
+  }
+
+  function withRuntimeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    return runtimeLifecycle.mutate(operation);
+  }
+
   function getModeAllowances(mode = activeMode): SessionAllowances {
     let allowances = allowancesByMode.get(mode);
     if (!allowances) {
@@ -194,9 +216,27 @@ export default function (pi: ExtensionAPI) {
     return allowances;
   }
 
+  function getModeOverrides(mode = activeMode): ExactSessionOverride[] {
+    let overrides = overridesByMode.get(mode);
+    if (!overrides) {
+      overrides = [];
+      overridesByMode.set(mode, overrides);
+    }
+    return overrides;
+  }
+
   function requirePolicy(): LoadedSandboxPolicy {
     if (!policy) throw new Error("Sandbox policy is not loaded");
     return policy;
+  }
+
+  function effectiveConfig() {
+    const loaded = requirePolicy();
+    return deriveConfigWithExactOverrides(
+      loaded.config,
+      getModeOverrides(),
+      activeCtx?.cwd ?? localCwd,
+    );
   }
 
   function loadPolicySnapshot(
@@ -204,6 +244,30 @@ export default function (pi: ExtensionAPI) {
   ): LoadedSandboxPolicy {
     const loaded = loadPolicy(ctx.cwd, activeMode, ctx.isProjectTrusted());
     policy = loaded;
+    const previousOverrides = getModeOverrides();
+    const validOverrides: ExactSessionOverride[] = [];
+    for (const override of previousOverrides) {
+      const classification = classifyExactSessionOverride({
+        operation: override.operation,
+        path: override.canonicalPath,
+        config: loaded.config,
+        cwd: ctx.cwd,
+        protectedWritePaths: loaded.protectedWritePaths,
+      });
+      if (
+        classification.exactRules.length > 0 &&
+        classification.broaderRules.length === 0 &&
+        classification.nonOverridableRules.length === 0
+      ) {
+        validOverrides.push({ ...override, removedRules: classification.exactRules });
+      } else {
+        ctx.ui.notify(
+          `Dropped stale exact deny override after policy reload: ${override.canonicalPath}`,
+          "warning",
+        );
+      }
+    }
+    overridesByMode.set(activeMode, validOverrides);
     projectRequestState = classifyProjectAccessRequests({
       requests: loaded.projectRequests,
       config: loaded.config,
@@ -291,14 +355,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   function effectiveReadPaths(): string[] {
-    const loaded = requirePolicy();
-    const config = loaded.config;
+    const config = effectiveConfig();
+    const overridePaths = overrideAllowances(getModeOverrides());
     return resolvePolicyPatterns(
       [
         ...(config.filesystem.allowRead ?? []),
         ...config.filesystem.allowWrite,
         ...getModeAllowances().readPaths,
         ...getModeAllowances().writePaths,
+        ...overridePaths.readPaths,
+        ...overridePaths.writePaths,
         ...declaredAllowances().readPaths,
         ...declaredAllowances().writePaths,
       ],
@@ -308,11 +374,13 @@ export default function (pi: ExtensionAPI) {
 
   function effectiveWritePaths(): string[] {
     if (getModePolicy(activeMode).write === "deny") return [];
-    const loaded = requirePolicy();
+    const config = effectiveConfig();
+    const overridePaths = overrideAllowances(getModeOverrides());
     return resolvePolicyPatterns(
       [
-        ...loaded.config.filesystem.allowWrite,
+        ...config.filesystem.allowWrite,
         ...getModeAllowances().writePaths,
+        ...overridePaths.writePaths,
         ...declaredAllowances().writePaths,
       ],
       activeCtx?.cwd ?? localCwd,
@@ -320,21 +388,26 @@ export default function (pi: ExtensionAPI) {
   }
 
   function runtimeConfigForActiveMode() {
-    const loaded = requirePolicy();
-    if (getModePolicy(activeMode).write !== "deny") return loaded.config;
+    const config = effectiveConfig();
+    if (getModePolicy(activeMode).write !== "deny") return config;
     return {
-      ...loaded.config,
-      filesystem: { ...loaded.config.filesystem, allowWrite: [] },
+      ...config,
+      filesystem: { ...config.filesystem, allowWrite: [] },
     };
   }
 
   function runtimeAllowancesForActiveMode(): SessionAllowances {
     const session = getModeAllowances();
+    const overrides = overrideAllowances(getModeOverrides());
     const declared = declaredAllowances();
     const allowances = {
       domains: [...new Set([...session.domains, ...declared.domains])],
-      readPaths: [...new Set([...session.readPaths, ...declared.readPaths])],
-      writePaths: [...new Set([...session.writePaths, ...declared.writePaths])],
+      readPaths: [
+        ...new Set([...session.readPaths, ...overrides.readPaths, ...declared.readPaths]),
+      ],
+      writePaths: [
+        ...new Set([...session.writePaths, ...overrides.writePaths, ...declared.writePaths]),
+      ],
     };
     return getModePolicy(activeMode).write === "deny"
       ? { ...allowances, writePaths: [] }
@@ -342,10 +415,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   function updateStatus(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]): void {
-    const loaded = requirePolicy();
+    const config = effectiveConfig();
     ctx.ui.setStatus(
       "sandbox",
-      ctx.ui.theme.fg("accent", formatSandboxStatus(loaded.config, activeMode, state)),
+      ctx.ui.theme.fg(
+        "accent",
+        formatSandboxStatus(config, activeMode, state, getModeOverrides().length),
+      ),
     );
   }
 
@@ -442,29 +518,31 @@ export default function (pi: ExtensionAPI) {
     cwd: string,
     refresh = true,
   ): Promise<void> {
-    await serialize(async () => {
-      const allowances = getModeAllowances();
-      const list =
-        kind === "domain"
-          ? allowances.domains
-          : kind === "read"
-            ? allowances.readPaths
-            : allowances.writePaths;
-      const added = !list.includes(value);
-      if (added) list.push(value);
-      try {
-        if (refresh) await refreshSandbox(cwd);
-      } catch (error) {
-        if (added) list.splice(list.indexOf(value), 1);
-        throw error;
-      }
-      const target = grantTarget(choice);
-      if (target) {
-        if (kind === "domain") addDomainToConfig(target, value);
-        else if (kind === "read") addReadPathToConfig(target, value);
-        else addWritePathToConfig(target, value);
-      }
-    });
+    const operation = () =>
+      serialize(async () => {
+        const allowances = getModeAllowances();
+        const list =
+          kind === "domain"
+            ? allowances.domains
+            : kind === "read"
+              ? allowances.readPaths
+              : allowances.writePaths;
+        const added = !list.includes(value);
+        if (added) list.push(value);
+        try {
+          if (refresh) await refreshSandbox(cwd);
+        } catch (error) {
+          if (added) list.splice(list.indexOf(value), 1);
+          throw error;
+        }
+        const target = grantTarget(choice);
+        if (target) {
+          if (kind === "domain") addDomainToConfig(target, value);
+          else if (kind === "read") addReadPathToConfig(target, value);
+          else addWritePathToConfig(target, value);
+        }
+      });
+    await (refresh ? withRuntimeMutation(operation) : operation());
   }
 
   async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
@@ -500,7 +578,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function structuredHardReadPatterns(): string[] {
-    const config = requirePolicy().config;
+    const config = effectiveConfig();
     return [
       ...config.filesystem.denyRead,
       ...(config.credentials?.files ?? []).map((entry) => entry.path),
@@ -508,8 +586,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function readDecision(path: string, cwd: string) {
-    const loaded = requirePolicy();
-    const config = loaded.config;
+    const config = effectiveConfig();
     return evaluateReadPolicy({
       path,
       cwd,
@@ -522,14 +599,25 @@ export default function (pi: ExtensionAPI) {
 
   function isHardWriteDenied(path: string, cwd: string): boolean {
     const loaded = requirePolicy();
-    return matchesPattern(
+    const config = effectiveConfig();
+    const finalProtection = classifyExactSessionOverride({
+      operation: "write",
       path,
-      [
-        ...loaded.config.filesystem.denyWrite,
-        ...structuredHardReadPatterns(),
-        ...loaded.protectedWritePaths,
-      ],
+      config,
       cwd,
+      protectedWritePaths: loaded.protectedWritePaths,
+    });
+    return (
+      finalProtection.nonOverridableRules.length > 0 ||
+      matchesPattern(
+        path,
+        [
+          ...config.filesystem.denyWrite,
+          ...structuredHardReadPatterns(),
+          ...loaded.protectedWritePaths,
+        ],
+        cwd,
+      )
     );
   }
 
@@ -546,10 +634,12 @@ export default function (pi: ExtensionAPI) {
         activeToolCtx = ctx;
         let result: AgentToolResult<any>;
         try {
-          result = await createBashToolDefinition(localCwd, {
-            operations: createSandboxedBashOps(userShellPath),
-            shellPath: userShellPath,
-          }).execute(id, params, signal, onUpdate, ctx);
+          result = await runSandboxChild(() =>
+            createBashToolDefinition(localCwd, {
+              operations: createSandboxedBashOps(userShellPath),
+              shellPath: userShellPath,
+            }).execute(id, params, signal, onUpdate, ctx),
+          );
         } catch (error) {
           if (!(error instanceof Error) || !extractSandboxViolation(error.message)) throw error;
           result = textResult(`Command failed with OS-level sandbox restriction: ${error.message}`);
@@ -632,7 +722,7 @@ export default function (pi: ExtensionAPI) {
       return {
         operations: {
           exec: (...args: Parameters<typeof operations.exec>) =>
-            serializeBash(() => operations.exec(...args)),
+            serializeBash(() => runSandboxChild(() => operations.exec(...args))),
         },
       };
     }
@@ -780,6 +870,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await cancelDeferredStartup();
+    allowancesByMode.clear();
+    overridesByMode.clear();
+    overrideConfirmationPending = false;
     activeMode =
       ((pi.getFlag("sandbox-mode") as string | undefined) || DEFAULT_MODE).trim() || DEFAULT_MODE;
     activeCtx = ctx;
@@ -818,9 +911,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     await cancelDeferredStartup();
+    allowancesByMode.clear();
+    overridesByMode.clear();
+    overrideConfirmationPending = false;
     if (state !== "active") return;
     try {
-      await SandboxManager.reset();
+      await withRuntimeMutation(() => SandboxManager.reset());
     } catch {
       // Cleanup is best effort; no more tools run after shutdown.
     }
@@ -850,8 +946,10 @@ export default function (pi: ExtensionAPI) {
     description: "Explicitly disable the sandbox for this session",
     handler: async (_args, ctx) => {
       await cancelDeferredStartup();
-      if (state === "active") await SandboxManager.reset();
-      state = "disabled-by-user";
+      await withRuntimeMutation(async () => {
+        if (state === "active") await SandboxManager.reset();
+        state = "disabled-by-user";
+      });
       updateStatus(ctx);
       ctx.ui.notify("Sandbox explicitly disabled; commands run with user permissions", "warning");
     },
@@ -868,45 +966,176 @@ export default function (pi: ExtensionAPI) {
           "warning",
         );
       }
-      await serialize(async () => {
-        const previousMode = activeMode;
-        const previousPolicy = policy;
-        const previousRequestState = projectRequestState;
-        activeMode = requestedMode;
-        try {
-          const loaded = loadPolicySnapshot(ctx);
-          if (!(await reviewProjectRequests(loaded, ctx))) {
-            throw new Error("mode switch aborted during project access review");
+      await withRuntimeMutation(() =>
+        serialize(async () => {
+          const previousMode = activeMode;
+          const previousPolicy = policy;
+          const previousRequestState = projectRequestState;
+          activeMode = requestedMode;
+          try {
+            const loaded = loadPolicySnapshot(ctx);
+            if (!(await reviewProjectRequests(loaded, ctx))) {
+              throw new Error("mode switch aborted during project access review");
+            }
+            if (state === "active") await refreshSandbox(ctx.cwd);
+            updateStatus(ctx);
+          } catch (error) {
+            activeMode = previousMode;
+            policy = previousPolicy;
+            projectRequestState = previousRequestState;
+            if (activeCtx && policy) updateStatus(activeCtx);
+            throw error;
           }
-          if (state === "active") await refreshSandbox(ctx.cwd);
-          updateStatus(ctx);
-        } catch (error) {
-          activeMode = previousMode;
-          policy = previousPolicy;
-          projectRequestState = previousRequestState;
-          throw error;
-        }
-      });
+        }),
+      );
       ctx.ui.notify(`Sandbox mode switched to "${activeMode}"`, "info");
     },
   });
 
-  async function commandGrant(
-    kind: "read" | "write",
-    args: unknown,
-    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
-  ) {
+  function classificationIdentity(classification: ExactOverrideClassification): string {
+    return JSON.stringify(classification);
+  }
+
+  function classifyCommandGrant(kind: "read" | "write", path: string, cwd: string) {
+    const loaded = requirePolicy();
+    return classifyExactSessionOverride({
+      operation: kind,
+      path,
+      config: loaded.config,
+      cwd,
+      protectedWritePaths: loaded.protectedWritePaths,
+    });
+  }
+
+  async function commandGrant(kind: "read" | "write", args: unknown, ctx: ExtensionCommandContext) {
     const raw = commandArgText(args);
     if (!raw) return void ctx.ui.notify(`Usage: /sandbox-allow-${kind} <path>`, "warning");
-    const path = canonicalizePath(raw, ctx.cwd);
-    if (kind === "read" && readDecision(path, ctx.cwd) === "hard-deny") {
-      return void ctx.ui.notify(`Cannot grant hard-denied read path: ${path}`, "error");
+    if (state !== "active") {
+      return void ctx.ui.notify(`Cannot grant access while sandbox is ${state}`, "error");
     }
-    if (kind === "write" && isHardWriteDenied(path, ctx.cwd)) {
-      return void ctx.ui.notify(`Cannot grant hard-denied write path: ${path}`, "error");
+    if (!canAuthorizeSessionGrant(ctx.mode, ctx.hasUI)) {
+      return void ctx.ui.notify(
+        "Session filesystem grants require TUI or RPC confirmation",
+        "error",
+      );
     }
-    await applyChoice("session", kind, path, ctx.cwd);
-    ctx.ui.notify(`Session ${kind} access granted: ${path}`, "info");
+    const modePolicy = getModePolicy(activeMode);
+    if (kind === "read" && modePolicy.read === "deny") {
+      return void ctx.ui.notify(`Sandbox mode "${activeMode}" denies reads`, "error");
+    }
+    if (kind === "write" && modePolicy.write === "deny") {
+      return void ctx.ui.notify(`Sandbox mode "${activeMode}" denies writes`, "error");
+    }
+
+    const classification = classifyCommandGrant(kind, raw, ctx.cwd);
+    if (classification.broaderRules.length) {
+      const rules = classification.broaderRules
+        .map((rule) => `${rule.field} ${rule.configuredValue}`)
+        .join(", ");
+      return void ctx.ui.notify(
+        `Cannot create a narrow session exception for ${classification.canonicalPath}; covered by broader rule(s): ${rules}`,
+        "error",
+      );
+    }
+    if (classification.nonOverridableRules.length) {
+      const rules = classification.nonOverridableRules
+        .map((rule) => `${rule.source}: ${rule.configuredValue}`)
+        .join(", ");
+      return void ctx.ui.notify(
+        `Cannot override non-overridable sandbox protection for ${classification.canonicalPath}: ${rules}`,
+        "error",
+      );
+    }
+    if (overrideConfirmationPending) {
+      return void ctx.ui.notify("Another sandbox grant confirmation is already pending", "warning");
+    }
+
+    const requestedMode = activeMode;
+    const confirmation = formatSessionGrantConfirmation({
+      operation: kind,
+      classification,
+      mode: requestedMode,
+    });
+
+    overrideConfirmationPending = true;
+    let confirmed = false;
+    try {
+      confirmed = await ctx.ui.confirm(confirmation.title, confirmation.message, {
+        timeout: 60_000,
+      });
+    } finally {
+      overrideConfirmationPending = false;
+    }
+    if (!confirmed) return void ctx.ui.notify("Session access grant cancelled", "info");
+
+    await ctx.waitForIdle();
+    await withRuntimeMutation(() =>
+      serialize(async () => {
+        if (state !== "active" || activeMode !== requestedMode) {
+          throw new Error("Sandbox state or mode changed; run the command and confirm again");
+        }
+        const current = classifyCommandGrant(kind, classification.canonicalPath, ctx.cwd);
+        if (classificationIdentity(current) !== classificationIdentity(classification)) {
+          throw new Error("Sandbox policy changed; run the command and confirm again");
+        }
+
+        const previousAllowances = structuredClone(getModeAllowances());
+        const previousOverrides = [...getModeOverrides()];
+        try {
+          if (current.exactRules.length) {
+            const overrides = getModeOverrides();
+            const hasWrite = overrides.some(
+              (entry) =>
+                entry.canonicalPath === current.canonicalPath && entry.operation === "write",
+            );
+            if (!(kind === "read" && hasWrite)) {
+              if (kind === "write") {
+                for (let index = overrides.length - 1; index >= 0; index--) {
+                  if (
+                    overrides[index].canonicalPath === current.canonicalPath &&
+                    overrides[index].operation === "read"
+                  ) {
+                    overrides.splice(index, 1);
+                  }
+                }
+              }
+              const existing = overrides.find(
+                (entry) =>
+                  entry.operation === kind && entry.canonicalPath === current.canonicalPath,
+              );
+              if (!existing) {
+                overrides.push({
+                  operation: kind,
+                  configuredValue: raw,
+                  canonicalPath: current.canonicalPath,
+                  removedRules: current.exactRules,
+                  createdAt: new Date().toISOString(),
+                });
+              }
+            }
+          } else {
+            const allowances = getModeAllowances();
+            const list = kind === "read" ? allowances.readPaths : allowances.writePaths;
+            if (!list.includes(current.canonicalPath)) list.push(current.canonicalPath);
+          }
+          await refreshSandbox(ctx.cwd);
+        } catch (error) {
+          allowancesByMode.set(requestedMode, previousAllowances);
+          overridesByMode.set(requestedMode, previousOverrides);
+          if (activeCtx) updateStatus(activeCtx);
+          throw error;
+        }
+      }),
+    );
+
+    if (classification.exactRules.length) {
+      ctx.ui.notify(
+        `Session ${kind} override active: ${classification.canonicalPath}\nTemporarily removed: ${classification.exactRules.map((rule) => `${rule.field} ${rule.configuredValue}`).join(", ")}\nOther deny rules remain active. This change is not persisted.`,
+        "warning",
+      );
+    } else {
+      ctx.ui.notify(`Session ${kind} access granted: ${classification.canonicalPath}`, "info");
+    }
   }
 
   pi.registerCommand("sandbox-allow-read", {
@@ -916,6 +1145,36 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("sandbox-allow-write", {
     description: "Grant session write access to an explicit path",
     handler: (args, ctx) => commandGrant("write", args, ctx),
+  });
+
+  pi.registerCommand("sandbox-clear-overrides", {
+    description: "Clear exact deny overrides for the active mode",
+    handler: async (_args, ctx) => {
+      if (state !== "active") {
+        return void ctx.ui.notify(`Cannot clear overrides while sandbox is ${state}`, "error");
+      }
+      if (!getModeOverrides().length) {
+        return void ctx.ui.notify(
+          `No exact deny overrides are active for mode "${activeMode}"`,
+          "info",
+        );
+      }
+      const mode = activeMode;
+      await withRuntimeMutation(() =>
+        serialize(async () => {
+          const previous = [...getModeOverrides(mode)];
+          overridesByMode.set(mode, []);
+          try {
+            await refreshSandbox(ctx.cwd);
+          } catch (error) {
+            overridesByMode.set(mode, previous);
+            if (activeCtx) updateStatus(activeCtx);
+            throw error;
+          }
+        }),
+      );
+      ctx.ui.notify(`Cleared exact deny overrides for mode "${mode}"`, "info");
+    },
   });
 
   pi.registerCommand("sandbox", {
@@ -936,6 +1195,8 @@ export default function (pi: ExtensionAPI) {
             ...bootstrapShellPaths,
           ],
           projectRequestState,
+          effectiveConfig(),
+          getModeOverrides(),
         ),
         "info",
       );
