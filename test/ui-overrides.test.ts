@@ -32,6 +32,19 @@ test("configuration distinguishes configured and effective denies", () => {
     filesystem: { ...configured.filesystem, denyRead: [] },
   };
   const loaded: LoadedSandboxPolicy = {
+    policyVersion: 2,
+    modeName: "default",
+    modePolicy: { read: "prompt", write: "prompt", network: "prompt" },
+    modePolicySource: "<built-in:v2-default>",
+    loadedConfigPaths: [],
+    configFileStates: {
+      globalBase: "not-found",
+      globalMode: "not-applicable",
+      projectBase: "not-found",
+      projectMode: "not-applicable",
+      projectGrant: "not-found",
+      projectRequestApproval: "not-found",
+    },
     config: configured,
     directConfig: configured,
     paths: {
@@ -60,4 +73,52 @@ test("configuration distinguishes configured and effective denies", () => {
   assert.match(output, /Effective hard deny read:  \(none\)/);
   assert.match(output, /read: \/project\/\.env/);
   assert.match(output, /removed: denyRead \.env/);
+});
+
+test("configuration reports data-driven mode provenance and config load states", () => {
+  const loaded: LoadedSandboxPolicy = {
+    policyVersion: 3,
+    modeName: "audit",
+    modePolicy: { read: "prompt", write: "deny", network: "deny" },
+    modePolicySource: "/agent/sandbox.audit.json",
+    loadedConfigPaths: ["/agent/sandbox.json", "/agent/sandbox.audit.json"],
+    configFileStates: {
+      globalBase: "loaded",
+      globalMode: "loaded",
+      projectBase: "not-found",
+      projectMode: "not-found",
+      projectGrant: "not-found",
+      projectRequestApproval: "not-found",
+    },
+    config: DEFAULT_CONFIG,
+    directConfig: DEFAULT_CONFIG,
+    paths: {
+      globalBasePath: "/agent/sandbox.json",
+      globalModePath: "/agent/sandbox.audit.json",
+      projectBasePath: "/project/.pi/sandbox.json",
+      projectModePath: "/project/.pi/sandbox.audit.json",
+      projectGrantPath: "/agent/sandbox-projects/audit.json",
+      projectRequestApprovalPath: "/agent/sandbox-projects/audit.requests.json",
+    },
+    projectRoot: "/project",
+    projectTrusted: true,
+    projectRequests: { readPaths: [], writePaths: [], domains: [] },
+    warnings: [],
+    protectedWritePaths: [],
+  };
+
+  const output = formatSandboxConfiguration(loaded, {
+    domains: [],
+    readPaths: [],
+    writePaths: [],
+  });
+  assert.match(output, /Policy version: 3/);
+  assert.match(output, /Active mode: audit/);
+  assert.match(output, /Mode behavior source: \/agent\/sandbox\.audit\.json/);
+  assert.match(output, /Write:\s+deny/);
+  assert.match(output, /Network:\s+deny/);
+  assert.match(output, /Global base:\s+\/agent\/sandbox\.json \(loaded\)/);
+  assert.match(output, /Project base:\s+\/project\/\.pi\/sandbox\.json \(not found\)/);
+  assert.match(output, /Effective allowed: \(none; denied by mode\)/);
+  assert.match(output, /Effective allow write: \(none; denied by mode\)/);
 });

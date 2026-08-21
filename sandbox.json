@@ -1,5 +1,10 @@
 {
-  "policyVersion": 2,
+  "policyVersion": 3,
+  "mode": {
+    "read": "prompt",
+    "write": "prompt",
+    "network": "prompt"
+  },
   "enabled": true,
   "failClosed": true,
   "network": {

@@ -6,7 +6,7 @@ import test from "node:test";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import assert from "node:assert/strict";
 
-import { DEFAULT_CONFIG } from "../src/config.ts";
+import { applyGlobalModeProfile, DEFAULT_CONFIG } from "../src/config.ts";
 import {
   buildRuntimeConfig,
   extractBlockedWritePath,
@@ -34,6 +34,36 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.deepEqual(runtime.filesystem?.denyReadAlways, []);
   assert.equal(runtime.enableWeakerNetworkIsolation, false);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
+});
+
+test("v3 replacement profile reaches runtime without inherited project grants", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-runtime-profile-"));
+  try {
+    const secret = join(cwd, "secret");
+    const base = {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem,
+        denyRead: [secret],
+        allowRead: [cwd],
+        allowWrite: [cwd, "/tmp"],
+      },
+    };
+    const profile = applyGlobalModeProfile(base, {
+      policyVersion: 3,
+      mode: { read: "prompt", write: "prompt", network: "prompt" },
+      filesystem: { allowRead: [], allowWrite: ["/tmp"], denyRead: [], denyWrite: [] },
+    });
+    const runtime = buildRuntimeConfig(profile, undefined, cwd);
+
+    assert.equal(runtime.filesystem.allowWrite?.includes(cwd), false);
+    assert.equal(runtime.filesystem.allowRead?.includes(cwd), false);
+    assert.equal(runtime.filesystem.allowWrite?.includes("/tmp"), true);
+    assert.equal(runtime.filesystem.allowRead?.includes("/tmp"), true);
+    assert.equal(runtime.filesystem.denyReadAlways?.includes(secret), true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("buildRuntimeConfig preserves a symlink allow path and its canonical target", () => {

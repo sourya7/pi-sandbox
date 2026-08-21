@@ -100,13 +100,18 @@ After building it, set `network.allowAllUnixSockets` to `false` in the active gl
 
 macOS does not use `apply-seccomp`; Seatbelt enforces Unix-socket restrictions there.
 
-## Policy version 2
+## Policy version 3 and data-driven modes
 
-A simple direct policy can live in trusted global configuration at `~/.pi/agent/sandbox.json`:
+A direct default policy lives in trusted global configuration at `~/.pi/agent/sandbox.json`. Version 3 makes execution behavior explicit policy data instead of tying it to hardcoded mode names:
 
 ```json
 {
-  "policyVersion": 2,
+  "policyVersion": 3,
+  "mode": {
+    "read": "prompt",
+    "write": "prompt",
+    "network": "prompt"
+  },
   "enabled": true,
   "failClosed": true,
   "network": {
@@ -122,6 +127,39 @@ A simple direct policy can live in trusted global configuration at `~/.pi/agent/
   }
 }
 ```
+
+Each safe lowercase name can be a mode. For example, `~/.pi/agent/sandbox.restricted.json` defines `pi --sandbox-mode restricted` without a code change:
+
+```json
+{
+  "policyVersion": 3,
+  "mode": {
+    "read": "prompt",
+    "write": "prompt",
+    "network": "deny"
+  },
+  "network": {
+    "allowedDomains": []
+  },
+  "filesystem": {
+    "allowRead": ["."],
+    "allowWrite": ["/tmp"]
+  }
+}
+```
+
+Mode names must match `^[a-z0-9][a-z0-9_-]*$`. A named v3 global mode file must exist and contain all three `mode` fields. Missing, malformed, and unsafe modes fail closed instead of silently using default behavior. Because writes imply reads, `read: "deny"` requires `write: "deny"`.
+
+Global v3 profiles use source-aware merge semantics:
+
+| Field | Named mode behavior |
+|---|---|
+| `allowRead`, `allowWrite`, `allowedDomains` | A present list replaces the inherited list; an omitted field inherits it. |
+| `denyRead`, `denyWrite`, `deniedDomains` | Union with inherited denies; a mode cannot erase a hard deny. |
+| Other trusted global controls | Normal scalar/object override. |
+| Project approvals, reactive grants, session grants | Additive after profile resolution, but categorical mode denies and hard denies still win. |
+
+Only trusted global configuration can define execution behavior. A project `.pi/sandbox*.json` `mode` field is ignored with a warning; project files can add restrictions and request capabilities but cannot weaken the selected mode.
 
 ### Read scopes
 
@@ -141,9 +179,18 @@ Within the protected region, priority is:
 
 Literal `allowRead` entries preserve symlink aliases and their resolved targets, including multi-link chains. Linux recreates allowed aliases hidden by the protected-region mount; macOS allows both spellings. Dangling links, cycles, and hard-denied targets remain blocked.
 
-V2 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
+V2 and v3 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
 
-Policies always use version 2 semantics. The `policyVersion` field may be omitted; if present, it must be `2`. Filesystem paths must be literals or use trailing `/**` subtree notation.
+### Migrating from policy version 2
+
+Version 2 remains compatible for the legacy `default`, `read-only`, and `build` behaviors. Custom v2 mode names no longer fall back to `default`; migrate them explicitly:
+
+1. Change the trusted global base and custom mode files to `"policyVersion": 3`.
+2. Add a complete `mode` object to `sandbox.json` and every `sandbox.<mode>.json`.
+3. Review every mode allow list. In v2 an empty list added nothing; in a v3 profile it intentionally clears inherited direct grants.
+4. Run `/sandbox` and verify the policy version, behavior source, file load states, and effective capabilities.
+
+Project declarations and user-owned reactive grants do not own execution behavior and may remain version 2. Request approval records also remain version 2 internal records.
 
 ## Configuration trust, project requests, and grants
 
@@ -151,7 +198,7 @@ Allow fields have source-dependent authority:
 
 | Source | Meaning of allow fields |
 |---|---|
-| Built-in and global policy | Direct grant |
+| Built-in defaults and trusted global base/mode profile | Direct grant |
 | Trusted project `.pi/sandbox*.json` | Request requiring user approval |
 | User-owned project grant | Direct, previously approved grant |
 | In-memory session allowance | Direct session grant |
@@ -224,9 +271,9 @@ When the requested canonical path exactly matches a configured `denyRead` or `de
 
 ```text
 pi --no-sandbox                     explicitly disable sandboxing for the session
-pi --sandbox-mode read-only         start in a named mode
-/sandbox                            show effective policy and capability details
-/sandbox-mode [default|read-only|build]
+pi --sandbox-mode restricted        start in a named global mode profile
+/sandbox                            show effective policy, sources, and capabilities
+/sandbox-mode [name]                show or switch mode; completion discovers global profiles
 /sandbox-enable
 /sandbox-disable                    explicit visible bypass for the current session
 /sandbox-allow-read <path>          operator-confirmed session grant/exact deny override
@@ -234,11 +281,7 @@ pi --sandbox-mode read-only         start in a named mode
 /sandbox-clear-overrides            clear exact deny overrides for the active mode
 ```
 
-| Mode | Read | Write | Network |
-|---|---|---|---|
-| `default` | policy prompt/fail-closed | policy prompt | policy prompt |
-| `read-only` | policy prompt/fail-closed | deny | policy prompt |
-| `build` | policy prompt/fail-closed | policy prompt | policy prompt |
+`prompt` permits the normal allow → prompt/fail-closed flow. `deny` is categorical: matching project approvals, reactive grants, session grants, and direct profile allows are removed at the runtime boundary and no permission prompt is offered. Version 3 permits arbitrary names and behavior combinations rather than a fixed mode table.
 
 Policy/runtime changes are serialized. If a refresh fails, the extension attempts to restore the previous runtime; if restoration fails, tool execution remains blocked.
 
@@ -276,7 +319,7 @@ npm test
 
 The root tests include:
 
-- v2 config/trust/path-policy tests;
+- v2 compatibility and v3 data-driven mode/config/trust/path-policy tests;
 - macOS Seatbelt profile-order tests that run without a macOS host;
 - Linux end-to-end final-deny tests when run on Linux;
 - local-runtime resolution and schema tests.

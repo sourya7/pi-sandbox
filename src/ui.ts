@@ -8,7 +8,7 @@ import {
   type ProjectRequestState,
 } from "./access-requests.ts";
 import { type LoadedSandboxPolicy, type SandboxConfig } from "./config.ts";
-import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
+import { DEFAULT_MODE, DEFAULT_MODE_POLICY, type ModePolicy } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 import { type ExactSessionOverride } from "./session-overrides.ts";
@@ -267,14 +267,17 @@ export function formatSandboxStatus(
   mode = DEFAULT_MODE,
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
   exactOverrideCount = 0,
+  modePolicy: ModePolicy = DEFAULT_MODE_POLICY,
 ): string {
   if (state === "failed") return "⛔ Sandbox unavailable — tools blocked";
   if (state === "initializing") return "⏳ Sandbox initializing — tools blocked";
   if (state === "disabled-by-user") return "⚠️ Sandbox explicitly disabled";
-  const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-    ? "all domains"
-    : `${config.network?.allowedDomains?.length ?? 0} domains`;
-  const modePolicy = getModePolicy(mode);
+  const networkLabel =
+    modePolicy.network === "deny"
+      ? "network denied"
+      : allowsAllDomains(config.network?.allowedDomains)
+        ? "all domains"
+        : `${config.network?.allowedDomains?.length ?? 0} domains`;
   const writeLabel =
     modePolicy.write === "deny"
       ? "writes denied"
@@ -328,10 +331,15 @@ function formatProjectRequestDiagnostics(state?: ProjectRequestState): string[] 
   return lines;
 }
 
+function formatConfigSource(path: string | undefined, state: string): string {
+  const displayPath = path ?? "(none)";
+  return `${displayPath} (${state.replaceAll("-", " ")})`;
+}
+
 export function formatSandboxConfiguration(
   loaded: LoadedSandboxPolicy,
   allowances: SessionAllowances,
-  mode = DEFAULT_MODE,
+  mode = loaded.modeName,
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
   bootstrapReadPaths: string[] = [],
   projectRequestState?: ProjectRequestState,
@@ -339,12 +347,25 @@ export function formatSandboxConfiguration(
   exactOverrides: ExactSessionOverride[] = [],
 ): string {
   const { config, paths } = loaded;
-  const modePolicy = getModePolicy(mode);
+  const modePolicy = loaded.modePolicy;
+  const effectiveDomains =
+    modePolicy.network === "deny"
+      ? "(none; denied by mode)"
+      : config.network?.allowedDomains?.join(", ") || "(none)";
+  const effectiveRead =
+    modePolicy.read === "deny"
+      ? "(none; denied by mode)"
+      : config.filesystem.allowRead?.join(", ") || "(none)";
+  const effectiveWrite =
+    modePolicy.write === "deny"
+      ? "(none; denied by mode)"
+      : config.filesystem.allowWrite.join(", ") || "(none)";
   return [
     "Sandbox Configuration",
     `  State: ${state}`,
-    "  Policy version: 2",
+    `  Policy version: ${loaded.policyVersion}`,
     `  Active mode: ${mode}`,
+    `  Mode behavior source: ${loaded.modePolicySource}`,
     `  Project policy trusted: ${loaded.projectTrusted ? "yes" : "no"}`,
     `  Read scope: ${config.filesystem.readScope ?? "home"}`,
     "  Mode policy:",
@@ -353,20 +374,20 @@ export function formatSandboxConfiguration(
     `    Network: ${modePolicy.network}`,
     "",
     "Config files:",
-    `  Global base:  ${paths.globalBasePath}`,
-    `  Global mode:  ${paths.globalModePath ?? "(none)"}`,
-    `  Project base: ${paths.projectBasePath}`,
-    `  Project mode: ${paths.projectModePath ?? "(none)"}`,
-    `  Reactive project grants (user-owned): ${paths.projectGrantPath}`,
-    `  Declared request approvals: ${paths.projectRequestApprovalPath}`,
+    `  Global base:  ${formatConfigSource(paths.globalBasePath, loaded.configFileStates.globalBase)}`,
+    `  Global mode:  ${formatConfigSource(paths.globalModePath, loaded.configFileStates.globalMode)}`,
+    `  Project base: ${formatConfigSource(paths.projectBasePath, loaded.configFileStates.projectBase)}`,
+    `  Project mode: ${formatConfigSource(paths.projectModePath, loaded.configFileStates.projectMode)}`,
+    `  Reactive project grants (user-owned): ${formatConfigSource(paths.projectGrantPath, loaded.configFileStates.projectGrant)}`,
+    `  Declared request approvals: ${formatConfigSource(paths.projectRequestApprovalPath, loaded.configFileStates.projectRequestApproval)}`,
     "",
     ...formatProjectRequestDiagnostics(projectRequestState),
     "",
     "Network (sandboxed bash + !cmd):",
-    `  Direct global/default allowed: ${loaded.directConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
+    `  Direct profile allowed: ${loaded.directConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
     `  Reactive project allowed: ${loaded.reactiveProjectGrant?.network?.allowedDomains?.join(", ") || "(none)"}`,
-    `  Effective allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-    ...(allowsAllDomains(config.network?.allowedDomains)
+    `  Effective allowed: ${effectiveDomains}`,
+    ...(modePolicy.network !== "deny" && allowsAllDomains(config.network?.allowedDomains)
       ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
       : []),
     `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
@@ -375,12 +396,12 @@ export function formatSandboxConfiguration(
     "Filesystem:",
     `  Configured hard deny read: ${config.filesystem.denyRead.join(", ") || "(none)"}`,
     `  Effective hard deny read:  ${effectiveConfig.filesystem.denyRead.join(", ") || "(none)"}`,
-    `  Direct global/default read:  ${loaded.directConfig.filesystem.allowRead?.join(", ") || "(none)"}`,
-    `  Direct global/default write: ${loaded.directConfig.filesystem.allowWrite.join(", ") || "(none)"}`,
+    `  Direct profile read:  ${loaded.directConfig.filesystem.allowRead?.join(", ") || "(none)"}`,
+    `  Direct profile write: ${loaded.directConfig.filesystem.allowWrite.join(", ") || "(none)"}`,
     `  Reactive project read:  ${loaded.reactiveProjectGrant?.filesystem?.allowRead?.join(", ") || "(none)"}`,
     `  Reactive project write: ${loaded.reactiveProjectGrant?.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-    `  Effective allow read:  ${config.filesystem.allowRead?.join(", ") || "(none)"}`,
-    `  Effective allow write: ${config.filesystem.allowWrite.join(", ") || "(none)"}`,
+    `  Effective allow read:  ${effectiveRead}`,
+    `  Effective allow write: ${effectiveWrite}`,
     "  Implicit read:  every allowWrite path (except hard-denied descendants)",
     `  Bootstrap read: ${[...new Set(bootstrapReadPaths)].join(", ") || "(none)"}`,
     `  Configured deny write: ${config.filesystem.denyWrite.join(", ") || "(none)"}`,

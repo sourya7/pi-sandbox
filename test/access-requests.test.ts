@@ -16,7 +16,13 @@ import {
   type ProjectRequestApproval,
 } from "../src/access-requests.ts";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
-import { getModePolicy } from "../src/modes.ts";
+import { getLegacyModePolicy } from "../src/modes.ts";
+
+function getModePolicy(mode: string) {
+  const policy = getLegacyModePolicy(mode);
+  assert.ok(policy, `expected legacy test mode ${mode}`);
+  return policy;
+}
 
 function declaration(value: string, sourcePath = ".pi/sandbox.json") {
   return { value, sourcePath, sourceKind: "project-base" as const };

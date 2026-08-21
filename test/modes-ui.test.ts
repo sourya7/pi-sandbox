@@ -7,25 +7,24 @@ import {
   normalizeProjectAccessRequests,
 } from "../src/access-requests.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { getModePolicy } from "../src/modes.ts";
+import { DEFAULT_MODE_POLICY } from "../src/modes.ts";
 import {
   formatProjectAccessRequestSummary,
   formatSandboxStatus,
   promptProjectAccessRequests,
 } from "../src/ui.ts";
 
-test("mode policies define read-only writes as deny", () => {
-  assert.equal(getModePolicy("default").write, "prompt");
-  assert.equal(getModePolicy("read-only").write, "deny");
-  assert.equal(getModePolicy("build").write, "prompt");
-  assert.deepEqual(getModePolicy("unknown"), getModePolicy("default"));
-});
-
-test("sandbox status includes active mode and write policy", () => {
+test("sandbox status includes arbitrary active mode and resolved behavior", () => {
   assert.match(formatSandboxStatus(DEFAULT_CONFIG, "build"), /Sandbox: build/);
   assert.match(formatSandboxStatus(DEFAULT_CONFIG, "build"), /write paths/);
-  assert.match(formatSandboxStatus(DEFAULT_CONFIG, "read-only"), /Sandbox: read-only/);
-  assert.match(formatSandboxStatus(DEFAULT_CONFIG, "read-only"), /writes denied/);
+  assert.match(
+    formatSandboxStatus(DEFAULT_CONFIG, "audit", "active", 0, {
+      read: "prompt",
+      write: "deny",
+      network: "deny",
+    }),
+    /Sandbox: audit.*writes denied.*network denied/,
+  );
 });
 
 function pendingRequestState() {
@@ -64,7 +63,7 @@ function pendingRequestState() {
     config,
     projectRoot: root,
     mode: "default",
-    modePolicy: getModePolicy("default"),
+    modePolicy: DEFAULT_MODE_POLICY,
     protectedWritePaths: [],
   });
 }

@@ -27,11 +27,12 @@ import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
+  listGlobalSandboxModes,
   loadPolicy,
   type LoadedSandboxPolicy,
   writeProjectRequestApproval,
 } from "./config.ts";
-import { DEFAULT_MODE, getModePolicy } from "./modes.ts";
+import { DEFAULT_MODE, DEFAULT_MODE_POLICY, type ModePolicy } from "./modes.ts";
 import {
   canonicalizePath,
   domainIsAllowed,
@@ -138,7 +139,7 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
   pi.registerFlag("sandbox-mode", {
-    description: "Sandbox mode to use, e.g. default, read-only, build",
+    description: "Sandbox mode to use, e.g. default or any trusted sandbox.<mode>.json profile",
     type: "string",
     default: DEFAULT_MODE,
   });
@@ -230,6 +231,10 @@ export default function (pi: ExtensionAPI) {
     return policy;
   }
 
+  function activeModePolicy(): ModePolicy {
+    return policy?.modePolicy ?? DEFAULT_MODE_POLICY;
+  }
+
   function effectiveConfig() {
     const loaded = requirePolicy();
     return deriveConfigWithExactOverrides(
@@ -273,7 +278,7 @@ export default function (pi: ExtensionAPI) {
       config: loaded.config,
       projectRoot: loaded.projectRoot,
       mode: activeMode,
-      modePolicy: getModePolicy(activeMode),
+      modePolicy: loaded.modePolicy,
       protectedWritePaths: loaded.protectedWritePaths,
       approval: loaded.projectRequestApproval,
     });
@@ -295,7 +300,7 @@ export default function (pi: ExtensionAPI) {
       config: loaded.config,
       projectRoot: loaded.projectRoot,
       mode: activeMode,
-      modePolicy: getModePolicy(activeMode),
+      modePolicy: loaded.modePolicy,
       protectedWritePaths: loaded.protectedWritePaths,
       approval: loaded.projectRequestApproval,
     });
@@ -338,6 +343,10 @@ export default function (pi: ExtensionAPI) {
           loaded.projectRequests,
           approved,
         );
+        if (!loaded.loadedConfigPaths.includes(loaded.paths.projectRequestApprovalPath)) {
+          loaded.loadedConfigPaths.push(loaded.paths.projectRequestApprovalPath);
+        }
+        loaded.configFileStates.projectRequestApproval = "loaded";
         requestState = reclassifyProjectRequests(loaded);
       } catch (error) {
         ctx.ui.notify(
@@ -373,7 +382,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function effectiveWritePaths(): string[] {
-    if (getModePolicy(activeMode).write === "deny") return [];
+    if (activeModePolicy().write === "deny") return [];
     const config = effectiveConfig();
     const overridePaths = overrideAllowances(getModeOverrides());
     return resolvePolicyPatterns(
@@ -389,10 +398,23 @@ export default function (pi: ExtensionAPI) {
 
   function runtimeConfigForActiveMode() {
     const config = effectiveConfig();
-    if (getModePolicy(activeMode).write !== "deny") return config;
+    const modePolicy = activeModePolicy();
+    if (
+      modePolicy.read !== "deny" &&
+      modePolicy.write !== "deny" &&
+      modePolicy.network !== "deny"
+    ) {
+      return config;
+    }
     return {
       ...config,
-      filesystem: { ...config.filesystem, allowWrite: [] },
+      network:
+        modePolicy.network === "deny" ? { ...config.network, allowedDomains: [] } : config.network,
+      filesystem: {
+        ...config.filesystem,
+        allowRead: modePolicy.read === "deny" ? [] : config.filesystem.allowRead,
+        allowWrite: modePolicy.write === "deny" ? [] : config.filesystem.allowWrite,
+      },
     };
   }
 
@@ -409,9 +431,12 @@ export default function (pi: ExtensionAPI) {
         ...new Set([...session.writePaths, ...overrides.writePaths, ...declared.writePaths]),
       ],
     };
-    return getModePolicy(activeMode).write === "deny"
-      ? { ...allowances, writePaths: [] }
-      : allowances;
+    const modePolicy = activeModePolicy();
+    return {
+      domains: modePolicy.network === "deny" ? [] : allowances.domains,
+      readPaths: modePolicy.read === "deny" ? [] : allowances.readPaths,
+      writePaths: modePolicy.write === "deny" ? [] : allowances.writePaths,
+    };
   }
 
   function updateStatus(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]): void {
@@ -420,7 +445,13 @@ export default function (pi: ExtensionAPI) {
       "sandbox",
       ctx.ui.theme.fg(
         "accent",
-        formatSandboxStatus(config, activeMode, state, getModeOverrides().length),
+        formatSandboxStatus(
+          config,
+          activeMode,
+          state,
+          getModeOverrides().length,
+          activeModePolicy(),
+        ),
       ),
     );
   }
@@ -454,7 +485,7 @@ export default function (pi: ExtensionAPI) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
       state = "active";
-      warnIfAllDomainsAllowed(ctx, loaded.config);
+      if (loaded.modePolicy.network !== "deny") warnIfAllDomainsAllowed(ctx, loaded.config);
       updateStatus(ctx);
       return true;
     } catch (error) {
@@ -547,6 +578,7 @@ export default function (pi: ExtensionAPI) {
 
   async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
     const loaded = requirePolicy();
+    if (loaded.modePolicy.network === "deny") return false;
     const allowed = [
       ...(loaded.config.network.allowedDomains ?? []),
       ...getModeAllowances().domains,
@@ -556,7 +588,7 @@ export default function (pi: ExtensionAPI) {
     const existing = pendingDomainPrompts.get(host);
     if (existing) return existing;
     const prompt = (async () => {
-      if (getModePolicy(activeMode).network === "deny") return false;
+      if (activeModePolicy().network === "deny") return false;
       const ctx = activeToolCtx ?? activeCtx;
       if (!ctx) return false;
       const choice = await promptDomainBlock(ctx, host);
@@ -593,7 +625,7 @@ export default function (pi: ExtensionAPI) {
       readScope: config.filesystem.readScope ?? "home",
       denyRead: structuredHardReadPatterns(),
       allowRead: effectiveReadPaths(),
-      modeBehavior: getModePolicy(activeMode).read,
+      modeBehavior: activeModePolicy().read,
     });
   }
 
@@ -668,10 +700,7 @@ export default function (pi: ExtensionAPI) {
             }
           }
         } else if (violation.type === "write") {
-          if (
-            isHardWriteDenied(violation.path, ctx.cwd) ||
-            getModePolicy(activeMode).write === "deny"
-          ) {
+          if (isHardWriteDenied(violation.path, ctx.cwd) || activeModePolicy().write === "deny") {
             return result;
           }
           const choice = await promptWriteBlock(ctx, violation.path);
@@ -707,6 +736,10 @@ export default function (pi: ExtensionAPI) {
       }
       if (params.operation === "write" && isHardWriteDenied(path, ctx.cwd)) {
         return textResult(`Denied: "${path}" is covered by a hard write deny.`);
+      }
+      const behavior = activeModePolicy()[params.operation];
+      if (behavior === "deny") {
+        return textResult(`Denied: sandbox mode "${activeMode}" denies ${params.operation}s.`);
       }
       const choice = await promptAccessRequest(ctx, params.operation, path, params.reason);
       if (choice === "abort")
@@ -798,7 +831,7 @@ export default function (pi: ExtensionAPI) {
       if (isHardWriteDenied(path, ctx.cwd)) {
         return { block: true, reason: `Sandbox hard-denies writes to "${path}".` };
       }
-      if (getModePolicy(activeMode).write === "deny") {
+      if (activeModePolicy().write === "deny") {
         return { block: true, reason: `Sandbox mode "${activeMode}" denies writes.` };
       }
       if (!matchesPattern(path, effectiveWritePaths(), ctx.cwd)) {
@@ -957,6 +990,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("sandbox-mode", {
     description: "Show or switch sandbox mode",
+    getArgumentCompletions: (prefix: string) => {
+      const modes = listGlobalSandboxModes().filter((mode) => mode.startsWith(prefix));
+      return modes.length ? modes.map((mode) => ({ value: mode, label: mode })) : null;
+    },
     handler: async (args, ctx) => {
       const requestedMode = commandArgText(args);
       if (!requestedMode) return void ctx.ui.notify(`Active sandbox mode: ${activeMode}`, "info");
@@ -1019,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
         "error",
       );
     }
-    const modePolicy = getModePolicy(activeMode);
+    const modePolicy = activeModePolicy();
     if (kind === "read" && modePolicy.read === "deny") {
       return void ctx.ui.notify(`Sandbox mode "${activeMode}" denies reads`, "error");
     }

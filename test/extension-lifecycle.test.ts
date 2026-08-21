@@ -11,14 +11,26 @@ import sandboxExtension from "../src/extension.ts";
 
 interface ExtensionHarness {
   handlers: Map<string, Array<(event: any, ctx: any) => Promise<unknown>>>;
-  commands: Map<string, { handler: (args: unknown, ctx: any) => Promise<void> }>;
+  commands: Map<
+    string,
+    {
+      handler: (args: unknown, ctx: any) => Promise<void>;
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+    }
+  >;
   tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
   pi: any;
 }
 
 function createExtensionHarness(): ExtensionHarness {
   const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<unknown>>>();
-  const commands = new Map<string, { handler: (args: unknown, ctx: any) => Promise<void> }>();
+  const commands = new Map<
+    string,
+    {
+      handler: (args: unknown, ctx: any) => Promise<void>;
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+    }
+  >();
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const flags = new Map<string, unknown>();
   const pi = {
@@ -27,6 +39,9 @@ function createExtensionHarness(): ExtensionHarness {
     },
     getFlag(name: string) {
       return flags.get(name);
+    },
+    setFlag(name: string, value: unknown) {
+      flags.set(name, value);
     },
     on(name: string, handler: (event: any, ctx: any) => Promise<unknown>) {
       const registered = handlers.get(name) ?? [];
@@ -38,7 +53,10 @@ function createExtensionHarness(): ExtensionHarness {
     },
     registerCommand(
       name: string,
-      command: { handler: (args: unknown, ctx: any) => Promise<void> },
+      command: {
+        handler: (args: unknown, ctx: any) => Promise<void>;
+        getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+      },
     ) {
       commands.set(name, command);
     },
@@ -385,6 +403,148 @@ test("RPC can confirm an exact override while JSON mode fails closed", async (t)
     await harness.commands.get("sandbox-allow-read")?.handler(".env", jsonCtx);
     assert.equal(runtimeConfigs.length, configCount);
     assert.match(notifications.at(-1) ?? "", /require TUI or RPC confirmation/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("v3 custom mode behavior drives runtime and exact tool enforcement", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-lifecycle-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-lifecycle-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(
+    join(agentDir, "sandbox.json"),
+    JSON.stringify({
+      policyVersion: 3,
+      mode: { read: "prompt", write: "prompt", network: "prompt" },
+      network: { allowedDomains: ["base.example"], deniedDomains: [] },
+      filesystem: {
+        readScope: "strict",
+        denyRead: [],
+        allowRead: ["."],
+        allowWrite: ["."],
+        denyWrite: [],
+      },
+    }),
+  );
+  writeFileSync(
+    join(agentDir, "sandbox.audit.json"),
+    JSON.stringify({
+      policyVersion: 3,
+      mode: { read: "prompt", write: "deny", network: "deny" },
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowRead: [], allowWrite: ["/tmp"], denyWrite: [] },
+    }),
+  );
+  let runtimeConfig: SandboxRuntimeConfig | undefined;
+  t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+    runtimeConfig = config;
+  });
+
+  const events: string[] = [];
+  const notifications: string[] = [];
+  try {
+    const harness = createExtensionHarness();
+    assert.deepEqual(harness.commands.get("sandbox-mode")?.getArgumentCompletions?.("a"), [
+      { value: "audit", label: "audit" },
+    ]);
+    harness.pi.setFlag("sandbox-mode", "audit");
+    const ctx = createContext(projectRoot, {
+      hasUI: false,
+      mode: "json",
+      events,
+      notifications,
+    });
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+
+    assert.ok(runtimeConfig);
+    assert.deepEqual(runtimeConfig.network?.allowedDomains, []);
+    assert.deepEqual(runtimeConfig.filesystem?.allowWrite, []);
+
+    const toolCall = harness.handlers.get("tool_call")?.[0];
+    assert.ok(toolCall);
+    const blocked = (await toolCall(
+      { type: "tool_call", toolName: "write", input: { path: "output.txt", content: "x" } },
+      ctx,
+    )) as any;
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /mode "audit" denies writes/);
+
+    const requestTool = harness.tools.get("request_sandbox_access");
+    assert.ok(requestTool);
+    const denied = await requestTool.execute(
+      "request-v3",
+      { operation: "write", path: "output.txt", reason: "test mode deny" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(denied.content[0].text, /mode "audit" denies writes/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("failed dynamic mode switches preserve the active runtime and policy snapshot", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-switch-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-switch-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(
+    join(agentDir, "sandbox.json"),
+    JSON.stringify({
+      policyVersion: 3,
+      mode: { read: "prompt", write: "prompt", network: "prompt" },
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        readScope: "strict",
+        denyRead: [],
+        allowRead: ["."],
+        allowWrite: ["."],
+        denyWrite: [],
+      },
+    }),
+  );
+  let initializeCount = 0;
+  let resetCount = 0;
+  t.mock.method(SandboxManager, "initialize", async () => {
+    initializeCount++;
+  });
+  t.mock.method(SandboxManager, "reset", async () => {
+    resetCount++;
+  });
+
+  const events: string[] = [];
+  const notifications: string[] = [];
+  try {
+    const harness = createExtensionHarness();
+    const ctx = createContext(projectRoot, {
+      hasUI: false,
+      mode: "json",
+      events,
+      notifications,
+    });
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+    assert.equal(initializeCount, 1);
+
+    await assert.rejects(
+      () => harness.commands.get("sandbox-mode")!.handler("missing", ctx),
+      /mode.*missing.*not defined/i,
+    );
+    assert.equal(initializeCount, 1);
+    assert.equal(resetCount, 0);
+
+    await harness.commands.get("sandbox-mode")?.handler("", ctx);
+    assert.equal(notifications.at(-1), "Active sandbox mode: default");
+    await harness.commands.get("sandbox")?.handler("", ctx);
+    assert.match(notifications.at(-1) ?? "", /Mode behavior source: .*sandbox\.json/);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

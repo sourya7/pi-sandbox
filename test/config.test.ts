@@ -14,9 +14,11 @@ import assert from "node:assert/strict";
 
 import {
   addReadPathToConfig,
+  applyGlobalModeProfile,
   deepMerge,
   DEFAULT_CONFIG,
   getConfigPaths,
+  listGlobalSandboxModes,
   loadPolicy,
   readProjectRequestApproval,
   validateConfig,
@@ -258,5 +260,235 @@ test("versionless policies reject non-portable filesystem globs", () => {
 });
 
 test("policy version 1 is rejected", () => {
-  assert.throws(() => validateConfig({ policyVersion: 1 }, "test policy"), /only policyVersion 2/);
+  assert.throws(
+    () => validateConfig({ policyVersion: 1 }, "test policy"),
+    /policyVersion must be 2 or 3/,
+  );
+});
+
+test("global mode discovery returns arbitrary safe profile names", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-mode-discovery-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    for (const name of [
+      "sandbox.audit.json",
+      "sandbox.read-only.json",
+      "sandbox.UPPER.json",
+      "sandbox.bad.name.json",
+      "settings.json",
+    ]) {
+      writeFileSync(join(agentDir, name), "{}");
+    }
+    assert.deepEqual(listGlobalSandboxModes(), ["default", "audit", "read-only"]);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("v3 global mode profiles replace present allows, inherit omitted allows, and union denies", () => {
+  const base = {
+    ...DEFAULT_CONFIG,
+    network: {
+      ...DEFAULT_CONFIG.network,
+      allowedDomains: ["base.example"],
+      deniedDomains: ["base-blocked.example"],
+    },
+    filesystem: {
+      ...DEFAULT_CONFIG.filesystem,
+      allowRead: [".", "/base-read"],
+      allowWrite: [".", "/tmp"],
+      denyRead: ["/base-secret"],
+      denyWrite: ["/base-locked"],
+    },
+  };
+  const merged = applyGlobalModeProfile(base, {
+    policyVersion: 3,
+    mode: { read: "prompt", write: "prompt", network: "prompt" },
+    network: { allowedDomains: [], deniedDomains: ["mode-blocked.example"] },
+    filesystem: {
+      allowRead: [],
+      allowWrite: ["/tmp"],
+      denyRead: ["/mode-secret"],
+      denyWrite: [],
+    },
+  });
+
+  assert.deepEqual(merged.network?.allowedDomains, []);
+  assert.deepEqual(merged.network?.deniedDomains, ["base-blocked.example", "mode-blocked.example"]);
+  assert.deepEqual(merged.filesystem.allowRead, []);
+  assert.deepEqual(merged.filesystem.allowWrite, ["/tmp"]);
+  assert.deepEqual(merged.filesystem.denyRead, ["/base-secret", "/mode-secret"]);
+  assert.deepEqual(merged.filesystem.denyWrite, ["/base-locked"]);
+
+  const inherited = applyGlobalModeProfile(base, {
+    policyVersion: 3,
+    mode: { read: "prompt", write: "prompt", network: "prompt" },
+    filesystem: { denyRead: [], allowWrite: ["/mode-write"], denyWrite: [] },
+  });
+  assert.deepEqual(inherited.filesystem.allowRead, [".", "/base-read"]);
+  assert.deepEqual(inherited.network?.allowedDomains, ["base.example"]);
+});
+
+test("v3 loads arbitrary named global modes with behavior and source provenance", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        mode: { read: "prompt", write: "prompt", network: "prompt" },
+        network: { allowedDomains: ["base.example"], deniedDomains: ["base-blocked.example"] },
+        filesystem: {
+          readScope: "home",
+          denyRead: ["/base-secret"],
+          allowRead: [".", "/base-read"],
+          allowWrite: [".", "/tmp"],
+          denyWrite: ["/base-locked"],
+        },
+      }),
+    );
+    const modePath = join(agentDir, "sandbox.audit.json");
+    writeFileSync(
+      modePath,
+      JSON.stringify({
+        policyVersion: 3,
+        mode: { read: "prompt", write: "deny", network: "deny" },
+        network: { allowedDomains: [], deniedDomains: ["mode-blocked.example"] },
+        filesystem: {
+          denyRead: ["/mode-secret"],
+          allowRead: [],
+          allowWrite: ["/tmp"],
+          denyWrite: [],
+        },
+      }),
+    );
+
+    const loaded = loadPolicy(cwd, "audit", false);
+    assert.equal(loaded.policyVersion, 3);
+    assert.equal(loaded.modeName, "audit");
+    assert.deepEqual(loaded.modePolicy, { read: "prompt", write: "deny", network: "deny" });
+    assert.equal(loaded.modePolicySource, modePath);
+    assert.deepEqual(loaded.config.filesystem.allowRead, []);
+    assert.deepEqual(loaded.config.filesystem.allowWrite, ["/tmp"]);
+    assert.deepEqual(loaded.config.filesystem.denyRead, [
+      ...DEFAULT_CONFIG.filesystem.denyRead,
+      "/base-secret",
+      "/mode-secret",
+    ]);
+    assert.deepEqual(loaded.config.network?.allowedDomains, []);
+    assert.equal(loaded.loadedConfigPaths.includes(modePath), true);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("custom modes fail closed when missing or still use v2 semantics", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-custom-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-custom-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 2,
+        filesystem: { denyRead: [], allowRead: ["."], allowWrite: ["."], denyWrite: [] },
+      }),
+    );
+    assert.throws(() => loadPolicy(cwd, "audit", false), /mode.*audit.*not defined/i);
+
+    writeFileSync(
+      join(agentDir, "sandbox.audit.json"),
+      JSON.stringify({ policyVersion: 2, filesystem: { allowRead: [] } }),
+    );
+    assert.throws(() => loadPolicy(cwd, "audit", false), /custom mode.*policyVersion 3/i);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("v3 profiles still apply reactive project grants additively without removing hard denies", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-grant-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-grant-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        mode: { read: "prompt", write: "prompt", network: "prompt" },
+        network: { allowedDomains: [], deniedDomains: ["blocked.example"] },
+        filesystem: {
+          denyRead: ["/secret"],
+          allowRead: [],
+          allowWrite: [],
+          denyWrite: ["/locked"],
+        },
+      }),
+    );
+    const grantPath = getConfigPaths(cwd).projectGrantPath;
+    mkdirSync(dirname(grantPath), { recursive: true });
+    writeFileSync(
+      grantPath,
+      JSON.stringify({
+        policyVersion: 2,
+        network: { allowedDomains: ["granted.example"] },
+        filesystem: { allowRead: ["/granted-read"], allowWrite: ["/granted-write"] },
+      }),
+    );
+
+    const loaded = loadPolicy(cwd, "default", false);
+    assert.deepEqual(loaded.directConfig.filesystem.allowRead, []);
+    assert.deepEqual(loaded.config.filesystem.allowRead, ["/granted-read"]);
+    assert.deepEqual(loaded.config.filesystem.allowWrite, ["/granted-write"]);
+    assert.equal(loaded.config.filesystem.denyRead.includes("/secret"), true);
+    assert.equal(loaded.config.filesystem.denyWrite.includes("/locked"), true);
+    assert.equal(loaded.config.network?.allowedDomains?.includes("granted.example"), true);
+    assert.equal(loaded.config.network?.deniedDomains?.includes("blocked.example"), true);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("project policy cannot define execution behavior", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-project-mode-authority-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-agent-mode-authority-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  mkdirSync(join(cwd, ".pi"));
+  try {
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        mode: { read: "prompt", write: "deny", network: "deny" },
+        filesystem: { denyRead: [], allowRead: ["."], allowWrite: [], denyWrite: [] },
+      }),
+    );
+    writeFileSync(
+      join(cwd, ".pi", "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        mode: "project-has-no-mode-authority",
+        filesystem: { denyWrite: ["project.lock"] },
+      }),
+    );
+
+    const loaded = loadPolicy(cwd, "default", true);
+    assert.deepEqual(loaded.modePolicy, { read: "prompt", write: "deny", network: "deny" });
+    assert.match(loaded.warnings.join("\n"), /Ignored unsupported project controls: mode/);
+    assert.equal(loaded.config.filesystem.denyWrite.includes("project.lock"), true);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
 });

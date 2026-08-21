@@ -5,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -23,6 +24,13 @@ import {
   normalizeProjectAccessRequests,
   projectRequestManifestHash,
 } from "./access-requests.ts";
+import {
+  DEFAULT_MODE,
+  getLegacyModePolicy,
+  type ModePolicy,
+  parseModePolicy,
+  validateModeName,
+} from "./modes.ts";
 import { canonicalizePath } from "./policy.ts";
 
 export type ReadScope = "home" | "strict" | "open";
@@ -38,11 +46,19 @@ export interface SandboxFilesystemConfig {
 }
 
 export interface SandboxConfig extends Omit<SandboxRuntimeConfig, "filesystem"> {
-  policyVersion?: 2;
+  policyVersion?: 2 | 3;
   enabled?: boolean;
   failClosed?: boolean;
   filesystem: SandboxFilesystemConfig;
 }
+
+type SandboxNetworkConfig = NonNullable<SandboxConfig["network"]>;
+
+export type SandboxPolicyDocument = Omit<Partial<SandboxConfig>, "network" | "filesystem"> & {
+  network?: Partial<SandboxNetworkConfig>;
+  filesystem?: Partial<SandboxFilesystemConfig>;
+  mode?: ModePolicy;
+};
 
 export interface SandboxConfigPaths {
   globalBasePath: string;
@@ -53,10 +69,25 @@ export interface SandboxConfigPaths {
   projectRequestApprovalPath: string;
 }
 
+export type ConfigFileState = "loaded" | "not-found" | "not-trusted" | "not-applicable";
+
 export interface LoadedSandboxPolicy {
+  policyVersion: 2 | 3;
+  modeName: string;
+  modePolicy: ModePolicy;
+  modePolicySource: string;
+  loadedConfigPaths: string[];
+  configFileStates: {
+    globalBase: ConfigFileState;
+    globalMode: ConfigFileState;
+    projectBase: ConfigFileState;
+    projectMode: ConfigFileState;
+    projectGrant: ConfigFileState;
+    projectRequestApproval: ConfigFileState;
+  };
   config: SandboxConfig;
   directConfig: SandboxConfig;
-  reactiveProjectGrant?: Partial<SandboxConfig>;
+  reactiveProjectGrant?: SandboxPolicyDocument;
   paths: SandboxConfigPaths;
   projectRoot: string;
   projectTrusted: boolean;
@@ -90,7 +121,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     denyRead: [],
     allowRead: ["."],
     allowWrite: [".", "/tmp"],
-    // V2 filesystem rules intentionally use portable literal/subtree paths.
+    // Filesystem rules intentionally use portable literal/subtree paths.
     denyWrite: [".env"],
   },
 };
@@ -100,8 +131,13 @@ function mergeList(base?: string[], override?: string[]): string[] | undefined {
   return [...new Set([...(base ?? []), ...(override ?? [])])];
 }
 
-export function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
-  const result: SandboxConfig = { ...base, ...overrides, filesystem: { ...base.filesystem } };
+export function deepMerge(base: SandboxConfig, overrides: SandboxPolicyDocument): SandboxConfig {
+  const { mode: _mode, ...configOverrides } = overrides;
+  const result = {
+    ...base,
+    ...configOverrides,
+    filesystem: { ...base.filesystem },
+  } as SandboxConfig;
 
   if (overrides.network) {
     result.network = {
@@ -125,6 +161,46 @@ export function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>
   return result;
 }
 
+export function applyGlobalModeProfile(
+  base: SandboxConfig,
+  profile: SandboxPolicyDocument,
+): SandboxConfig {
+  const { mode: _mode, ...configOverrides } = profile;
+  const result = {
+    ...base,
+    ...configOverrides,
+    filesystem: { ...base.filesystem },
+  } as SandboxConfig;
+  if (profile.network) {
+    result.network = {
+      ...base.network,
+      ...profile.network,
+      allowedDomains:
+        profile.network.allowedDomains === undefined
+          ? [...(base.network?.allowedDomains ?? [])]
+          : [...new Set(profile.network.allowedDomains)],
+      deniedDomains: mergeList(base.network?.deniedDomains, profile.network.deniedDomains) ?? [],
+    };
+  }
+  if (profile.filesystem) {
+    result.filesystem = {
+      ...base.filesystem,
+      ...profile.filesystem,
+      allowRead:
+        profile.filesystem.allowRead === undefined
+          ? [...(base.filesystem.allowRead ?? [])]
+          : [...new Set(profile.filesystem.allowRead)],
+      allowWrite:
+        profile.filesystem.allowWrite === undefined
+          ? [...base.filesystem.allowWrite]
+          : [...new Set(profile.filesystem.allowWrite)],
+      denyRead: mergeList(base.filesystem.denyRead, profile.filesystem.denyRead) ?? [],
+      denyWrite: mergeList(base.filesystem.denyWrite, profile.filesystem.denyWrite) ?? [],
+    };
+  }
+  return result;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -135,7 +211,7 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
   }
 }
 
-function hasUnsupportedV2Glob(pattern: string): boolean {
+function hasUnsupportedFilesystemGlob(pattern: string): boolean {
   const withoutSubtree = pattern.replace(/\/\*\*$/, "");
   return ["*", "?", "[", "]"].some((character) => withoutSubtree.includes(character));
 }
@@ -156,11 +232,13 @@ function assertDomainPattern(pattern: string, field: string): void {
 export function validateConfig(
   value: unknown,
   source = "sandbox configuration",
-): Partial<SandboxConfig> {
+  validateMode = true,
+): SandboxPolicyDocument {
   if (!isRecord(value)) throw new Error(`${source}: expected a JSON object`);
-  if (value.policyVersion !== undefined && value.policyVersion !== 2) {
-    throw new Error(`${source}: only policyVersion 2 is supported; omit policyVersion or use 2`);
+  if (value.policyVersion !== undefined && value.policyVersion !== 2 && value.policyVersion !== 3) {
+    throw new Error(`${source}: policyVersion must be 2 or 3`);
   }
+  if (validateMode && value.mode !== undefined) parseModePolicy(value.mode, source);
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error(`${source}: enabled must be boolean`);
   }
@@ -197,7 +275,7 @@ export function validateConfig(
     }
     for (const field of ["denyRead", "allowRead", "allowWrite", "denyWrite"] as const) {
       const bad = Array.isArray(filesystem[field])
-        ? (filesystem[field] as string[]).find(hasUnsupportedV2Glob)
+        ? (filesystem[field] as string[]).find(hasUnsupportedFilesystemGlob)
         : undefined;
       if (bad) {
         throw new Error(
@@ -206,10 +284,13 @@ export function validateConfig(
       }
     }
   }
-  return value as Partial<SandboxConfig>;
+  return value as SandboxPolicyDocument;
 }
 
-function readJsonConfig(configPath: string): Partial<SandboxConfig> | undefined {
+function readJsonConfig(
+  configPath: string,
+  validateMode = true,
+): SandboxPolicyDocument | undefined {
   if (!existsSync(configPath)) return undefined;
   let parsed: unknown;
   try {
@@ -217,7 +298,7 @@ function readJsonConfig(configPath: string): Partial<SandboxConfig> | undefined 
   } catch (error) {
     throw new Error(`Could not parse ${configPath}: ${error}`);
   }
-  return validateConfig(parsed, configPath);
+  return validateConfig(parsed, configPath, validateMode);
 }
 
 function modeSuffix(mode: string): string {
@@ -228,7 +309,8 @@ function projectId(cwd: string): string {
   return createHash("sha256").update(canonicalizePath(cwd)).digest("hex").slice(0, 24);
 }
 
-export function getConfigPaths(cwd: string, mode = "default"): SandboxConfigPaths {
+export function getConfigPaths(cwd: string, mode = DEFAULT_MODE): SandboxConfigPaths {
+  validateModeName(mode);
   const suffix = modeSuffix(mode);
   const id = projectId(cwd);
   return {
@@ -245,6 +327,19 @@ export function getConfigPaths(cwd: string, mode = "default"): SandboxConfigPath
   };
 }
 
+export function listGlobalSandboxModes(): string[] {
+  const modes = new Set<string>([DEFAULT_MODE]);
+  try {
+    for (const name of readdirSync(getAgentDir())) {
+      const match = name.match(/^sandbox\.([a-z0-9][a-z0-9_-]*)\.json$/);
+      if (match) modes.add(match[1]);
+    }
+  } catch {
+    // The built-in default remains available before the agent directory exists.
+  }
+  return [DEFAULT_MODE, ...[...modes].filter((mode) => mode !== DEFAULT_MODE).sort()];
+}
+
 function declarations(
   values: string[] | undefined,
   sourcePath: string,
@@ -254,11 +349,11 @@ function declarations(
 }
 
 export function splitProjectConfig(
-  raw: Partial<SandboxConfig>,
+  raw: SandboxPolicyDocument,
   sourcePath: string,
   sourceKind: ProjectRequestSourceKind,
   warnings: string[],
-): { restrictions: Partial<SandboxConfig>; requests: ProjectAccessRequests } {
+): { restrictions: SandboxPolicyDocument; requests: ProjectAccessRequests } {
   if (raw.network?.allowedDomains?.includes("*")) {
     throw new Error(`${sourcePath}: project network.allowedDomains cannot contain "*"`);
   }
@@ -314,7 +409,7 @@ function validatePortablePaths(config: SandboxConfig, source: string): void {
     allowWrite: config.filesystem.allowWrite,
     denyWrite: config.filesystem.denyWrite,
   })) {
-    const bad = patterns.find(hasUnsupportedV2Glob);
+    const bad = patterns.find(hasUnsupportedFilesystemGlob);
     if (bad) {
       throw new Error(
         `${source}: filesystem.${field} pattern "${bad}" is not portable; use a literal path or trailing /**`,
@@ -340,7 +435,7 @@ function parseApproval(value: unknown, source: string): ProjectRequestApproval {
     for (const path of value.approved[field] as string[]) {
       const subtree = path.endsWith("/**");
       const raw = subtree ? path.slice(0, -3) || "/" : path;
-      if (!isAbsolute(raw) || hasUnsupportedV2Glob(path)) {
+      if (!isAbsolute(raw) || hasUnsupportedFilesystemGlob(path)) {
         throw new Error(`${source}: approved.${field} paths must be canonical absolute paths`);
       }
       const canonical = canonicalizePath(raw);
@@ -400,22 +495,88 @@ export function readProjectRequestApproval(
   }
 }
 
+function resolveModeBehavior(
+  mode: string,
+  globalBase: SandboxPolicyDocument | undefined,
+  globalMode: SandboxPolicyDocument | undefined,
+  paths: SandboxConfigPaths,
+): { policy: ModePolicy; source: string; version: 2 | 3 } {
+  if (mode === DEFAULT_MODE) {
+    if (globalBase?.policyVersion === 3) {
+      if (!globalBase.mode) {
+        throw new Error(`${paths.globalBasePath}: policyVersion 3 requires an explicit mode block`);
+      }
+      return {
+        policy: parseModePolicy(globalBase.mode, paths.globalBasePath),
+        source: paths.globalBasePath,
+        version: 3,
+      };
+    }
+    return {
+      policy: getLegacyModePolicy(DEFAULT_MODE)!,
+      source: "<built-in:v2-default>",
+      version: 2,
+    };
+  }
+
+  if (globalMode?.policyVersion === 3) {
+    if (!globalMode.mode) {
+      throw new Error(`${paths.globalModePath}: policyVersion 3 requires an explicit mode block`);
+    }
+    return {
+      policy: parseModePolicy(globalMode.mode, paths.globalModePath ?? "global mode policy"),
+      source: paths.globalModePath ?? "global mode policy",
+      version: 3,
+    };
+  }
+
+  const legacy = getLegacyModePolicy(mode);
+  if (legacy && globalBase?.policyVersion !== 3) {
+    return { policy: legacy, source: `<built-in:v2-${mode}>`, version: 2 };
+  }
+  if (!globalMode) {
+    throw new Error(
+      `Sandbox mode "${mode}" is not defined; create ${paths.globalModePath} with policyVersion 3 and an explicit mode block`,
+    );
+  }
+  throw new Error(
+    `Custom mode "${mode}" requires policyVersion 3 and an explicit mode block in ${paths.globalModePath}`,
+  );
+}
+
 export function loadPolicy(
   cwd: string,
-  mode = "default",
+  mode = DEFAULT_MODE,
   projectTrusted = false,
 ): LoadedSandboxPolicy {
+  validateModeName(mode);
   const projectRoot = canonicalizePath(cwd);
   const paths = getConfigPaths(projectRoot, mode);
   const globalBase = readJsonConfig(paths.globalBasePath);
   const globalMode = paths.globalModePath ? readJsonConfig(paths.globalModePath) : undefined;
-  const projectBase = projectTrusted ? readJsonConfig(paths.projectBasePath) : undefined;
+  const projectBase = projectTrusted ? readJsonConfig(paths.projectBasePath, false) : undefined;
   const projectMode =
-    projectTrusted && paths.projectModePath ? readJsonConfig(paths.projectModePath) : undefined;
+    projectTrusted && paths.projectModePath
+      ? readJsonConfig(paths.projectModePath, false)
+      : undefined;
   const projectGrant = readJsonConfig(paths.projectGrantPath);
+  const modeBehavior = resolveModeBehavior(mode, globalBase, globalMode, paths);
+  const policyVersion: 2 | 3 =
+    modeBehavior.version === 3 || globalBase?.policyVersion === 3 ? 3 : 2;
   let config: SandboxConfig = structuredClone(DEFAULT_CONFIG);
   const warnings: string[] = [];
-  for (const source of [globalBase, globalMode]) if (source) config = deepMerge(config, source);
+  if (globalBase) {
+    config =
+      globalBase.policyVersion === 3
+        ? applyGlobalModeProfile(config, globalBase)
+        : deepMerge(config, globalBase);
+  }
+  if (globalMode) {
+    config =
+      globalMode.policyVersion === 3
+        ? applyGlobalModeProfile(config, globalMode)
+        : deepMerge(config, globalMode);
+  }
 
   const projectParts: ProjectAccessRequests[] = [];
   if (projectBase) {
@@ -428,11 +589,11 @@ export function loadPolicy(
     config = deepMerge(config, split.restrictions);
     projectParts.push(split.requests);
   }
-  config.policyVersion = 2;
+  config.policyVersion = policyVersion;
   config.filesystem.readScope ??= "home";
   const directConfig = structuredClone(config);
   if (projectGrant) config = deepMerge(config, projectGrant);
-  config.policyVersion = 2;
+  config.policyVersion = policyVersion;
   config.filesystem.readScope ??= "home";
   validatePortablePaths(config, "effective sandbox policy");
 
@@ -451,7 +612,38 @@ export function loadPolicy(
     paths.projectGrantPath,
     paths.projectRequestApprovalPath,
   ].map((path) => canonicalizePath(path));
+  const loadedConfigPaths = [
+    ...(globalBase ? [paths.globalBasePath] : []),
+    ...(globalMode && paths.globalModePath ? [paths.globalModePath] : []),
+    ...(projectBase ? [paths.projectBasePath] : []),
+    ...(projectMode && paths.projectModePath ? [paths.projectModePath] : []),
+    ...(projectGrant ? [paths.projectGrantPath] : []),
+    ...(projectRequestApproval ? [paths.projectRequestApprovalPath] : []),
+  ];
   return {
+    policyVersion,
+    modeName: mode,
+    modePolicy: modeBehavior.policy,
+    modePolicySource: modeBehavior.source,
+    loadedConfigPaths,
+    configFileStates: {
+      globalBase: globalBase ? "loaded" : "not-found",
+      globalMode: paths.globalModePath ? (globalMode ? "loaded" : "not-found") : "not-applicable",
+      projectBase: !projectTrusted ? "not-trusted" : projectBase ? "loaded" : "not-found",
+      projectMode: !paths.projectModePath
+        ? "not-applicable"
+        : !projectTrusted
+          ? "not-trusted"
+          : projectMode
+            ? "loaded"
+            : "not-found",
+      projectGrant: projectGrant ? "loaded" : "not-found",
+      projectRequestApproval: !projectTrusted
+        ? "not-trusted"
+        : projectRequestApproval
+          ? "loaded"
+          : "not-found",
+    },
     config,
     directConfig,
     reactiveProjectGrant: projectGrant,
@@ -488,7 +680,7 @@ function writeJsonFile(configPath: string, value: unknown): void {
   }
 }
 
-function readWritableConfig(configPath: string): Partial<SandboxConfig> {
+function readWritableConfig(configPath: string): SandboxPolicyDocument {
   return readJsonConfig(configPath) ?? { policyVersion: 2 };
 }
 
