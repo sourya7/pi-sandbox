@@ -102,95 +102,138 @@ macOS does not use `apply-seccomp`; Seatbelt enforces Unix-socket restrictions t
 
 ## Policy version 3 and data-driven modes
 
-A direct default policy lives in trusted global configuration at `~/.pi/agent/sandbox.json`. Version 3 makes execution behavior explicit policy data instead of tying it to hardcoded mode names:
+The trusted default policy lives at `~/.pi/agent/sandbox.json`. Version 3 models each capability as an allow list, a hard-deny list, and an `otherwise` action:
 
 ```json
 {
   "policyVersion": 3,
-  "mode": {
-    "read": "prompt",
-    "write": "prompt",
-    "network": "prompt"
-  },
   "enabled": true,
   "failClosed": true,
   "network": {
-    "allowedDomains": ["github.com", "*.github.com", "registry.npmjs.org"],
-    "deniedDomains": []
+    "allow": ["github.com", "*.github.com", "registry.npmjs.org"],
+    "deny": [],
+    "otherwise": "prompt"
   },
   "filesystem": {
-    "readScope": "home",
-    "allowRead": ["."],
-    "denyRead": ["~/.ssh", "~/.aws"],
-    "allowWrite": [".", "/tmp"],
-    "denyWrite": [".env"]
+    "read": {
+      "scope": "home",
+      "allow": ["."],
+      "deny": ["~/.ssh", "~/.aws"],
+      "otherwise": "prompt"
+    },
+    "write": {
+      "allow": [".", "/tmp"],
+      "deny": [".env"],
+      "otherwise": "prompt"
+    }
   }
 }
 ```
 
-Each safe lowercase name can be a mode. For example, `~/.pi/agent/sandbox.restricted.json` defines `pi --sandbox-mode restricted` without a code change:
+Evaluation is consistent for each capability:
+
+1. An explicit hard deny blocks the operation without prompting.
+2. A resolved explicit allowance permits it without prompting.
+3. `otherwise: "prompt"` requests approval when possible and otherwise fails closed.
+4. `otherwise: "deny"` silently blocks an unlisted operation.
+
+An `otherwise` deny does not erase listed allowances. This is a normal default-deny allowlist:
 
 ```json
 {
   "policyVersion": 3,
-  "mode": {
-    "read": "prompt",
-    "write": "prompt",
-    "network": "deny"
-  },
   "network": {
-    "allowedDomains": []
+    "allow": ["github.com", "*.github.com"],
+    "deny": [],
+    "otherwise": "deny"
   },
   "filesystem": {
-    "allowRead": ["."],
-    "allowWrite": ["/tmp"]
+    "read": {
+      "scope": "strict",
+      "allow": ["."],
+      "deny": [],
+      "otherwise": "prompt"
+    },
+    "write": {
+      "allow": ["/tmp"],
+      "deny": [],
+      "otherwise": "deny"
+    }
   }
 }
 ```
 
-Mode names must match `^[a-z0-9][a-z0-9_-]*$`. A named v3 global mode file must exist and contain all three `mode` fields. Missing, malformed, and unsafe modes fail closed instead of silently using default behavior. Because writes imply reads, `read: "deny"` requires `write: "deny"`.
+Here GitHub and `/tmp` remain directly available, while other network destinations and writes are denied without a prompt.
 
-Global v3 profiles use source-aware merge semantics:
+### Named profiles
 
-| Field | Named mode behavior |
+Every safe lowercase filename defines a mode. For example, `~/.pi/agent/sandbox.restricted.json` defines `pi --sandbox-mode restricted` without a registry or code change:
+
+```json
+{
+  "policyVersion": 3,
+  "network": {
+    "allow": ["github.com", "*.github.com"],
+    "otherwise": "deny"
+  },
+  "filesystem": {
+    "read": {
+      "allow": [],
+      "otherwise": "prompt"
+    },
+    "write": {
+      "allow": ["/tmp"],
+      "otherwise": "deny"
+    }
+  }
+}
+```
+
+The filename identifies the profile; there is no inner `mode` block. Mode names must match `^[a-z0-9][a-z0-9_-]*$`. Missing, malformed, unsafe, and custom v2 profiles fail closed rather than silently using default behavior.
+
+The v3 base must explicitly define read, write, and network `otherwise` actions. A named profile may override an action or omit it to inherit the base action.
+
+Global profiles use source-aware merge semantics:
+
+| Field | Named profile behavior |
 |---|---|
-| `allowRead`, `allowWrite`, `allowedDomains` | A present list replaces the inherited list; an omitted field inherits it. |
-| `denyRead`, `denyWrite`, `deniedDomains` | Union with inherited denies; a mode cannot erase a hard deny. |
+| `filesystem.read.allow`, `filesystem.write.allow`, `network.allow` | A present list replaces the inherited list; an omitted field inherits it. |
+| `filesystem.read.deny`, `filesystem.write.deny`, `network.deny` | Union with inherited denies; a profile cannot erase a hard deny. |
+| `otherwise` and `filesystem.read.scope` | A present value overrides; an omitted value inherits. |
 | Other trusted global controls | Normal scalar/object override. |
-| Project approvals, reactive grants, session grants | Additive after profile resolution, but categorical mode denies and hard denies still win. |
+| Project approvals, reactive grants, session grants | Add explicit allowances after trusted-profile resolution; hard denies still win. |
 
-Only trusted global configuration can define execution behavior. A project `.pi/sandbox*.json` `mode` field is ignored with a warning; project files can add restrictions and request capabilities but cannot weaken the selected mode.
+Only trusted global configuration controls `otherwise` and read scope. Project files can add restrictions and request explicit capabilities, but cannot alter fallback behavior.
 
 ### Read scopes
 
 | Scope | Behavior |
 |---|---|
-| `home` | Protect the user's home directory and reopen configured paths. Recommended default. Paths outside home remain readable unless hard-denied. |
-| `strict` | Protect filesystem root and reopen configured/runtime-bootstrap paths. |
+| `home` | Protect the user's home directory and reopen configured paths. Paths outside home remain readable unless hard-denied. |
+| `strict` | Protect filesystem root and reopen configured/runtime-bootstrap paths. Use this for a true listed-only read policy. |
 | `open` | No implicit protected region; only explicit hard denies. |
 
-Within the protected region, priority is:
+`filesystem.write.allow` necessarily implies read access, except below a hard deny. Hard read denies are also protected from writes and renames so a process cannot move a secret into a readable location.
 
-1. `denyRead` — authoritative hard deny; no prompt.
-2. `allowRead` or `allowWrite` — allowed without prompting.
-3. Anything else — prompt when the path is known, otherwise fail closed.
-
-`allowWrite` necessarily implies read access, except below a more-specific hard deny. Hard read denies are also protected from writes/renames so a process cannot move a secret into a readable location.
-
-Literal `allowRead` entries preserve symlink aliases and their resolved targets, including multi-link chains. Linux recreates allowed aliases hidden by the protected-region mount; macOS allows both spellings. Dangling links, cycles, and hard-denied targets remain blocked.
+Literal read allowances preserve symlink aliases and their resolved targets, including multi-link chains. Linux recreates allowed aliases hidden by the protected-region mount; macOS allows both spellings. Dangling links, cycles, and hard-denied targets remain blocked.
 
 V2 and v3 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
 
-### Migrating from policy version 2
+### Migrating from policy version 2 or the earlier v3 draft
 
-Version 2 remains compatible for the legacy `default`, `read-only`, and `build` behaviors. Custom v2 mode names no longer fall back to `default`; migrate them explicitly:
+Version 2 remains compatible for the legacy `default`, `read-only`, and `build` modes. Custom v2 mode names do not fall back to default.
 
-1. Change the trusted global base and custom mode files to `"policyVersion": 3`.
-2. Add a complete `mode` object to `sandbox.json` and every `sandbox.<mode>.json`.
-3. Review every mode allow list. In v2 an empty list added nothing; in a v3 profile it intentionally clears inherited direct grants.
-4. Run `/sandbox` and verify the policy version, behavior source, file load states, and effective capabilities.
+For each trusted global file:
 
-Project declarations and user-owned reactive grants do not own execution behavior and may remain version 2. Request approval records also remain version 2 internal records.
+1. Set `"policyVersion": 3`.
+2. Remove the obsolete inner `mode` object.
+3. Move `allowedDomains`/`deniedDomains` to `network.allow`/`network.deny` and add `network.otherwise`.
+4. Move `readScope`, `allowRead`, and `denyRead` under `filesystem.read` as `scope`, `allow`, and `deny`; add `otherwise`.
+5. Move `allowWrite` and `denyWrite` under `filesystem.write` as `allow` and `deny`; add `otherwise`.
+6. Review named-profile allow lists: a present list replaces inherited direct allowances, while an omitted list inherits.
+7. Run `/sandbox` and verify the resolved actions, per-capability sources, file states, and effective allowances.
+
+Project declarations and user-owned reactive grants may remain version 2. Request approval records remain version 2 internal records.
 
 ## Configuration trust, project requests, and grants
 
@@ -221,7 +264,7 @@ A trusted project can declare reproducible access needs using the existing field
 }
 ```
 
-Project `allowRead`, `allowWrite`, and `allowedDomains` entries are reviewed before sandbox startup. Trust permits loading this declaration but does not approve it. Project deny entries apply immediately because they only restrict access. External paths are valid requests; they are not silently granted or discarded. Project wildcard domain requests and powerful controls remain rejected.
+Project `allowRead`, `allowWrite`, and `allowedDomains` entries are reviewed before sandbox startup. A project may also use the v3 nested spellings (`filesystem.read.allow`, `filesystem.write.allow`, and `network.allow`). Project v3 `otherwise` and read-scope values are ignored with a warning because fallback behavior belongs to trusted global policy. Trust permits loading a declaration but does not approve it. Project deny entries apply immediately because they only restrict access. External paths are valid requests; they are not silently granted or discarded. Project wildcard domain requests and powerful controls remain rejected.
 
 Pi does not normally treat `.pi/sandbox*.json` alone as a trust-triggering resource. When this package is loaded as a user/global or CLI extension, it participates in Pi's `project_trust` event so a sandbox-only project can be trusted explicitly. If other trust-triggering Pi resources are present, it defers to Pi's built-in trust flow.
 
@@ -235,7 +278,7 @@ Reactive “Allow for this project” grants remain separate in `<project-id>[.<
 - `/sandbox` reports project requests, their sources and statuses, declared approvals, and reactive grants separately.
 - Policy is validated and snapshotted. It is not reread before every tool call.
 
-Global configuration is the place for powerful controls such as `filesystem.disabled`, wildcard domains, Unix socket access, Apple Events, or weaker isolation flags. `enableWeakerNetworkIsolation` is false by default. Global hard denies and active mode denies remain authoritative over project approvals; no global delegation setting is required.
+Global configuration is the place for powerful controls such as `filesystem.disabled`, wildcard domains, Unix socket access, Apple Events, or weaker isolation flags. `enableWeakerNetworkIsolation` is false by default. Global hard denies remain authoritative over every project approval; no global delegation setting is required.
 
 ## Tool behavior
 
@@ -265,7 +308,7 @@ Pi's built-in `grep` and `find` implementations spawn local `rg`/`fd` processes 
 
 These commands always require a separate operator confirmation. In TUI mode Pi displays it directly; in RPC mode it emits an `extension_ui_request` with `method: "confirm"` for the trusted client (for example Emacs) to display and answer. JSON and print modes cannot authorize grants. The agent-facing `request_sandbox_access` tool cannot remove hard denies or initiate an exact-deny override.
 
-When the requested canonical path exactly matches a configured `denyRead` or `denyWrite` root, confirmation creates an in-memory override for the active mode and session: Pi derives an effective policy with only that exact rule removed and adds the path as a session allowance. Nested exceptions are intentionally rejected—for example, `~/.ssh/known_hosts` cannot be reopened beneath `denyRead: ["~/.ssh"]`—because removing the broader rule would expose more than requested. Credential rules, mode denies, policy/control files, and Sandbox Runtime mandatory write protections remain non-overridable. Use trusted user policy or `/sandbox-disable` explicitly when exact-match semantics are insufficient.
+When the requested canonical path exactly matches a configured `denyRead` or `denyWrite` root, confirmation creates an in-memory override for the active mode and session: Pi derives an effective policy with only that exact rule removed and adds the path as a session allowance. Nested exceptions are intentionally rejected—for example, `~/.ssh/known_hosts` cannot be reopened beneath `denyRead: ["~/.ssh"]`—because removing the broader rule would expose more than requested. Credential rules, policy/control files, and Sandbox Runtime mandatory write protections remain non-overridable. Use trusted user policy or `/sandbox-disable` explicitly when exact-match semantics are insufficient.
 
 ## Commands and modes
 
@@ -281,7 +324,7 @@ pi --sandbox-mode restricted        start in a named global mode profile
 /sandbox-clear-overrides            clear exact deny overrides for the active mode
 ```
 
-`prompt` permits the normal allow → prompt/fail-closed flow. `deny` is categorical: matching project approvals, reactive grants, session grants, and direct profile allows are removed at the runtime boundary and no permission prompt is offered. Version 3 permits arbitrary names and behavior combinations rather than a fixed mode table.
+`otherwise: "prompt"` enables escalation for an operation that has no matching allow or deny rule. `otherwise: "deny"` silently denies only unlisted operations; explicit profile allowances and approved grants remain active. Version 3 permits arbitrary named profiles rather than a fixed mode table.
 
 Policy/runtime changes are serialized. If a refresh fails, the extension attempts to restore the previous runtime; if restoration fails, tool execution remains blocked.
 

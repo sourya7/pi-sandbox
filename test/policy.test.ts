@@ -64,11 +64,25 @@ test("v2 read policy applies hard deny before allow and scope", () => {
     readScope: "strict" as const,
     denyRead: [join(cwd, "secret")],
     allowRead: [cwd],
-    modeBehavior: "prompt" as const,
+    otherwise: "prompt" as const,
   };
   assert.equal(evaluateReadPolicy({ ...common, path: join(cwd, "secret", "key") }), "hard-deny");
   assert.equal(evaluateReadPolicy({ ...common, path: join(cwd, "source.ts") }), "allow");
   assert.equal(evaluateReadPolicy({ ...common, path: "/unlisted" }), "prompt");
+});
+
+test("otherwise deny still permits explicitly listed reads", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-read-otherwise-"));
+  const listed = join(cwd, "listed");
+  const common = {
+    cwd,
+    readScope: "strict" as const,
+    denyRead: [],
+    allowRead: [listed],
+    otherwise: "deny" as const,
+  };
+  assert.equal(evaluateReadPolicy({ ...common, path: listed }), "allow");
+  assert.equal(evaluateReadPolicy({ ...common, path: join(cwd, "other") }), "unlisted-deny");
 });
 
 test("open and home scopes allow paths outside their protected region", () => {
@@ -80,7 +94,7 @@ test("open and home scopes allow paths outside their protected region", () => {
       readScope: "open",
       denyRead: [],
       allowRead: [],
-      modeBehavior: "prompt",
+      otherwise: "prompt",
     }),
     "outside-scope-allow",
   );
@@ -98,7 +112,7 @@ test("home scope protects a home symlink even when its target is outside home", 
       readScope: "home" as const,
       denyRead: [],
       allowRead: [],
-      modeBehavior: "prompt" as const,
+      otherwise: "prompt" as const,
     };
     assert.equal(evaluateReadPolicy(input), "prompt");
     assert.equal(evaluateReadPolicy({ ...input, allowRead: [link] }), "allow");

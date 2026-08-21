@@ -8,7 +8,13 @@ import {
   type ProjectRequestState,
 } from "./access-requests.ts";
 import { type LoadedSandboxPolicy, type SandboxConfig } from "./config.ts";
-import { DEFAULT_MODE, DEFAULT_MODE_POLICY, type ModePolicy } from "./modes.ts";
+import {
+  type CategoricalDenies,
+  DEFAULT_MODE,
+  DEFAULT_OTHERWISE_POLICY,
+  NO_CATEGORICAL_DENIES,
+  type OtherwisePolicy,
+} from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 import { type ExactSessionOverride } from "./session-overrides.ts";
@@ -138,11 +144,11 @@ export function promptDomainBlock(
   ctx: ExtensionContext,
   domain: string,
 ): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `🌐 Network blocked: "${domain}" is not in allowedDomains`);
+  return showPermissionPrompt(ctx, `🌐 Network blocked: "${domain}" is not explicitly allowed`);
 }
 
 export function promptReadBlock(ctx: ExtensionContext, path: string): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `📖 Read blocked: "${path}" is not in allowRead`);
+  return showPermissionPrompt(ctx, `📖 Read blocked: "${path}" is not explicitly allowed`);
 }
 
 export function promptWriteBlock(ctx: ExtensionContext, path: string): Promise<PermissionChoice> {
@@ -267,21 +273,20 @@ export function formatSandboxStatus(
   mode = DEFAULT_MODE,
   state: "disabled-by-user" | "initializing" | "active" | "failed" = "active",
   exactOverrideCount = 0,
-  modePolicy: ModePolicy = DEFAULT_MODE_POLICY,
+  otherwisePolicy: OtherwisePolicy = DEFAULT_OTHERWISE_POLICY,
+  categorical: CategoricalDenies = NO_CATEGORICAL_DENIES,
 ): string {
   if (state === "failed") return "⛔ Sandbox unavailable — tools blocked";
   if (state === "initializing") return "⏳ Sandbox initializing — tools blocked";
   if (state === "disabled-by-user") return "⚠️ Sandbox explicitly disabled";
-  const networkLabel =
-    modePolicy.network === "deny"
-      ? "network denied"
-      : allowsAllDomains(config.network?.allowedDomains)
-        ? "all domains"
-        : `${config.network?.allowedDomains?.length ?? 0} domains`;
-  const writeLabel =
-    modePolicy.write === "deny"
-      ? "writes denied"
-      : `${config.filesystem.allowWrite.length} write paths`;
+  const networkLabel = categorical.network
+    ? "network denied by legacy mode"
+    : allowsAllDomains(config.network?.allowedDomains)
+      ? "all domains"
+      : `${config.network?.allowedDomains?.length ?? 0} domains · unlisted ${otherwisePolicy.network}`;
+  const writeLabel = categorical.write
+    ? "writes denied by legacy mode"
+    : `${config.filesystem.allowWrite.length} write paths · unlisted ${otherwisePolicy.write}`;
   const scope = config.filesystem.readScope ?? "home";
   const overrideLabel = exactOverrideCount
     ? ` · ⚠️ ${exactOverrideCount} exact deny override${exactOverrideCount === 1 ? "" : "s"}`
@@ -347,31 +352,32 @@ export function formatSandboxConfiguration(
   exactOverrides: ExactSessionOverride[] = [],
 ): string {
   const { config, paths } = loaded;
-  const modePolicy = loaded.modePolicy;
-  const effectiveDomains =
-    modePolicy.network === "deny"
-      ? "(none; denied by mode)"
-      : config.network?.allowedDomains?.join(", ") || "(none)";
-  const effectiveRead =
-    modePolicy.read === "deny"
-      ? "(none; denied by mode)"
-      : config.filesystem.allowRead?.join(", ") || "(none)";
-  const effectiveWrite =
-    modePolicy.write === "deny"
-      ? "(none; denied by mode)"
-      : config.filesystem.allowWrite.join(", ") || "(none)";
+  const otherwise = loaded.otherwisePolicy;
+  const categorical = loaded.legacyCategoricalDenies;
+  const effectiveDomains = categorical.network
+    ? "(none; denied by legacy mode)"
+    : config.network?.allowedDomains?.join(", ") || "(none)";
+  const effectiveRead = categorical.read
+    ? "(none; denied by legacy mode)"
+    : config.filesystem.allowRead?.join(", ") || "(none)";
+  const effectiveWrite = categorical.write
+    ? "(none; denied by legacy mode)"
+    : config.filesystem.allowWrite.join(", ") || "(none)";
   return [
     "Sandbox Configuration",
     `  State: ${state}`,
     `  Policy version: ${loaded.policyVersion}`,
     `  Active mode: ${mode}`,
-    `  Mode behavior source: ${loaded.modePolicySource}`,
     `  Project policy trusted: ${loaded.projectTrusted ? "yes" : "no"}`,
     `  Read scope: ${config.filesystem.readScope ?? "home"}`,
-    "  Mode policy:",
-    `    Read:    ${modePolicy.read}`,
-    `    Write:   ${modePolicy.write}`,
-    `    Network: ${modePolicy.network}`,
+    "  Otherwise actions:",
+    `    Read:    ${otherwise.read}`,
+    `    Write:   ${otherwise.write}`,
+    `    Network: ${otherwise.network}`,
+    "  Otherwise sources:",
+    `    Read:    ${loaded.otherwisePolicySources.read}`,
+    `    Write:   ${loaded.otherwisePolicySources.write}`,
+    `    Network: ${loaded.otherwisePolicySources.network}`,
     "",
     "Config files:",
     `  Global base:  ${formatConfigSource(paths.globalBasePath, loaded.configFileStates.globalBase)}`,
@@ -387,7 +393,7 @@ export function formatSandboxConfiguration(
     `  Direct profile allowed: ${loaded.directConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
     `  Reactive project allowed: ${loaded.reactiveProjectGrant?.network?.allowedDomains?.join(", ") || "(none)"}`,
     `  Effective allowed: ${effectiveDomains}`,
-    ...(modePolicy.network !== "deny" && allowsAllDomains(config.network?.allowedDomains)
+    ...(!categorical.network && allowsAllDomains(config.network?.allowedDomains)
       ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
       : []),
     `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,

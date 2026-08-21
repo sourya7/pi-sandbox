@@ -1,31 +1,38 @@
-export type RestrictionBehavior = "prompt" | "deny";
+export type OtherwiseAction = "prompt" | "deny";
 
-export interface ModePolicy {
-  read: RestrictionBehavior;
-  write: RestrictionBehavior;
-  network: RestrictionBehavior;
+export interface OtherwisePolicy {
+  read: OtherwiseAction;
+  write: OtherwiseAction;
+  network: OtherwiseAction;
+}
+
+export interface CategoricalDenies {
+  read: boolean;
+  write: boolean;
+  network: boolean;
 }
 
 export const DEFAULT_MODE = "default";
-export const DEFAULT_MODE_POLICY: ModePolicy = {
+export const DEFAULT_OTHERWISE_POLICY: OtherwisePolicy = {
   read: "prompt",
   write: "prompt",
   network: "prompt",
 };
+export const NO_CATEGORICAL_DENIES: CategoricalDenies = {
+  read: false,
+  write: false,
+  network: false,
+};
 
-const LEGACY_MODE_POLICIES: Readonly<Record<string, ModePolicy>> = {
-  default: DEFAULT_MODE_POLICY,
+const LEGACY_MODE_POLICIES: Readonly<Record<string, OtherwisePolicy>> = {
+  default: DEFAULT_OTHERWISE_POLICY,
   "read-only": {
     read: "prompt",
     write: "deny",
     network: "prompt",
   },
-  build: DEFAULT_MODE_POLICY,
+  build: DEFAULT_OTHERWISE_POLICY,
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 export function validateModeName(mode: string): string {
   if (!/^[a-z0-9][a-z0-9_-]*$/.test(mode)) {
@@ -36,25 +43,22 @@ export function validateModeName(mode: string): string {
   return mode;
 }
 
-export function parseModePolicy(value: unknown, source: string): ModePolicy {
-  if (!isRecord(value)) throw new Error(`${source}: mode must be an object`);
-  const supportedFields = new Set(["read", "write", "network"]);
-  const unsupported = Object.keys(value).find((field) => !supportedFields.has(field));
-  if (unsupported) throw new Error(`${source}: unsupported mode field ${unsupported}`);
-  const parsed: Partial<ModePolicy> = {};
-  for (const field of ["read", "write", "network"] as const) {
-    const behavior = value[field];
-    if (behavior !== "prompt" && behavior !== "deny") {
-      throw new Error(`${source}: mode.${field} must be prompt or deny`);
-    }
-    parsed[field] = behavior;
+export function parseOtherwiseAction(value: unknown, field: string): OtherwiseAction {
+  if (value !== "prompt" && value !== "deny") {
+    throw new Error(`${field} must be prompt or deny`);
   }
-  if (parsed.read === "deny" && parsed.write !== "deny") {
-    throw new Error(`${source}: mode read deny requires write deny because writes imply reads`);
-  }
-  return parsed as ModePolicy;
+  return value;
 }
 
-export function getLegacyModePolicy(mode: string): ModePolicy | undefined {
+export function getLegacyModePolicy(mode: string): OtherwisePolicy | undefined {
   return LEGACY_MODE_POLICIES[mode];
+}
+
+export function getLegacyCategoricalDenies(mode: string): CategoricalDenies {
+  const policy = getLegacyModePolicy(mode);
+  return {
+    read: policy?.read === "deny",
+    write: policy?.write === "deny",
+    network: policy?.network === "deny",
+  };
 }

@@ -7,7 +7,7 @@ import {
   normalizeProjectAccessRequests,
 } from "../src/access-requests.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { DEFAULT_MODE_POLICY } from "../src/modes.ts";
+import { NO_CATEGORICAL_DENIES } from "../src/modes.ts";
 import {
   formatProjectAccessRequestSummary,
   formatSandboxStatus,
@@ -23,7 +23,7 @@ test("sandbox status includes arbitrary active mode and resolved behavior", () =
       write: "deny",
       network: "deny",
     }),
-    /Sandbox: audit.*writes denied.*network denied/,
+    /Sandbox: audit.*write paths · unlisted deny.*domains · unlisted deny/,
   );
 });
 
@@ -63,7 +63,7 @@ function pendingRequestState() {
     config,
     projectRoot: root,
     mode: "default",
-    modePolicy: DEFAULT_MODE_POLICY,
+    legacyCategoricalDenies: NO_CATEGORICAL_DENIES,
     protectedWritePaths: [],
   });
 }

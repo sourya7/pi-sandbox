@@ -34,8 +34,13 @@ test("configuration distinguishes configured and effective denies", () => {
   const loaded: LoadedSandboxPolicy = {
     policyVersion: 2,
     modeName: "default",
-    modePolicy: { read: "prompt", write: "prompt", network: "prompt" },
-    modePolicySource: "<built-in:v2-default>",
+    otherwisePolicy: { read: "prompt", write: "prompt", network: "prompt" },
+    otherwisePolicySources: {
+      read: "<built-in:v2-default>",
+      write: "<built-in:v2-default>",
+      network: "<built-in:v2-default>",
+    },
+    legacyCategoricalDenies: { read: false, write: false, network: false },
     loadedConfigPaths: [],
     configFileStates: {
       globalBase: "not-found",
@@ -79,8 +84,13 @@ test("configuration reports data-driven mode provenance and config load states",
   const loaded: LoadedSandboxPolicy = {
     policyVersion: 3,
     modeName: "audit",
-    modePolicy: { read: "prompt", write: "deny", network: "deny" },
-    modePolicySource: "/agent/sandbox.audit.json",
+    otherwisePolicy: { read: "prompt", write: "deny", network: "deny" },
+    otherwisePolicySources: {
+      read: "/agent/sandbox.audit.json",
+      write: "/agent/sandbox.audit.json",
+      network: "/agent/sandbox.audit.json",
+    },
+    legacyCategoricalDenies: { read: false, write: false, network: false },
     loadedConfigPaths: ["/agent/sandbox.json", "/agent/sandbox.audit.json"],
     configFileStates: {
       globalBase: "loaded",
@@ -114,11 +124,11 @@ test("configuration reports data-driven mode provenance and config load states",
   });
   assert.match(output, /Policy version: 3/);
   assert.match(output, /Active mode: audit/);
-  assert.match(output, /Mode behavior source: \/agent\/sandbox\.audit\.json/);
+  assert.match(output, /Otherwise sources:[\s\S]*\/agent\/sandbox\.audit\.json/);
   assert.match(output, /Write:\s+deny/);
   assert.match(output, /Network:\s+deny/);
   assert.match(output, /Global base:\s+\/agent\/sandbox\.json \(loaded\)/);
   assert.match(output, /Project base:\s+\/project\/\.pi\/sandbox\.json \(not found\)/);
-  assert.match(output, /Effective allowed: \(none; denied by mode\)/);
-  assert.match(output, /Effective allow write: \(none; denied by mode\)/);
+  assert.match(output, /Effective allowed: .*github\.com/);
+  assert.match(output, /Effective allow write: \., \/tmp/);
 });

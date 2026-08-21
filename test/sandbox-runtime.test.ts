@@ -6,7 +6,7 @@ import test from "node:test";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import assert from "node:assert/strict";
 
-import { applyGlobalModeProfile, DEFAULT_CONFIG } from "../src/config.ts";
+import { applyGlobalModeProfile, DEFAULT_CONFIG, validateConfig } from "../src/config.ts";
 import {
   buildRuntimeConfig,
   extractBlockedWritePath,
@@ -49,11 +49,16 @@ test("v3 replacement profile reaches runtime without inherited project grants", 
         allowWrite: [cwd, "/tmp"],
       },
     };
-    const profile = applyGlobalModeProfile(base, {
-      policyVersion: 3,
-      mode: { read: "prompt", write: "prompt", network: "prompt" },
-      filesystem: { allowRead: [], allowWrite: ["/tmp"], denyRead: [], denyWrite: [] },
-    });
+    const profile = applyGlobalModeProfile(
+      base,
+      validateConfig({
+        policyVersion: 3,
+        filesystem: {
+          read: { allow: [], deny: [], otherwise: "deny" },
+          write: { allow: ["/tmp"], deny: [], otherwise: "deny" },
+        },
+      }),
+    );
     const runtime = buildRuntimeConfig(profile, undefined, cwd);
 
     assert.equal(runtime.filesystem.allowWrite?.includes(cwd), false);

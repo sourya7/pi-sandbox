@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 
 import {
   addReadPathToConfig,
+  addWritePathToConfig,
   applyGlobalModeProfile,
   deepMerge,
   DEFAULT_CONFIG,
@@ -24,6 +25,19 @@ import {
   validateConfig,
   writeProjectRequestApproval,
 } from "../src/config.ts";
+
+function withIsolatedV2AgentDir<T>(run: () => T): T {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-test-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(join(agentDir, "sandbox.json"), JSON.stringify({ policyVersion: 2 }));
+  try {
+    return run();
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+}
 
 test("deepMerge merges sections while adding configured arrays", () => {
   const merged = deepMerge(DEFAULT_CONFIG, {
@@ -108,37 +122,46 @@ test("getConfigPaths includes mode-specific files for named modes", () => {
 
 test("loadPolicy extracts project base and mode allows as requests", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-config-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   mkdirSync(join(cwd, ".pi"));
-  writeFileSync(
-    join(cwd, ".pi", "sandbox.json"),
-    JSON.stringify({
-      network: { allowedDomains: ["project.example"], deniedDomains: ["blocked.example"] },
-      filesystem: { allowRead: ["project-base"], denyWrite: ["base.key"] },
-    }),
-  );
-  writeFileSync(
-    join(cwd, ".pi", "sandbox.read-only.json"),
-    JSON.stringify({ filesystem: { allowRead: ["project-mode"], denyWrite: ["mode.key"] } }),
-  );
+  try {
+    writeFileSync(join(agentDir, "sandbox.json"), JSON.stringify({ policyVersion: 2 }));
+    writeFileSync(
+      join(cwd, ".pi", "sandbox.json"),
+      JSON.stringify({
+        network: { allowedDomains: ["project.example"], deniedDomains: ["blocked.example"] },
+        filesystem: { allowRead: ["project-base"], denyWrite: ["base.key"] },
+      }),
+    );
+    writeFileSync(
+      join(cwd, ".pi", "sandbox.read-only.json"),
+      JSON.stringify({ filesystem: { allowRead: ["project-mode"], denyWrite: ["mode.key"] } }),
+    );
 
-  const loaded = loadPolicy(cwd, "read-only", true);
-  assert.equal(loaded.config.policyVersion, 2);
-  assert.equal(loaded.config.filesystem.readScope, "home");
-  assert.equal(loaded.config.filesystem.allowRead?.includes("."), true);
-  assert.equal(loaded.config.filesystem.allowRead?.includes("project-base"), false);
-  assert.equal(loaded.config.filesystem.allowRead?.includes("project-mode"), false);
-  assert.deepEqual(
-    loaded.projectRequests.readPaths.map((request) => request.canonicalPath),
-    [join(cwd, "project-base"), join(cwd, "project-mode")],
-  );
-  assert.equal(loaded.config.filesystem.denyWrite.includes("base.key"), true);
-  assert.equal(loaded.config.filesystem.denyWrite.includes("mode.key"), true);
-  assert.equal(loaded.config.network?.allowedDomains?.includes("project.example"), false);
-  assert.equal(loaded.config.network?.deniedDomains?.includes("blocked.example"), true);
-  assert.deepEqual(
-    loaded.projectRequests.domains.map((request) => request.domain),
-    ["project.example"],
-  );
+    const loaded = loadPolicy(cwd, "read-only", true);
+    assert.equal(loaded.config.policyVersion, 2);
+    assert.equal(loaded.config.filesystem.readScope, "home");
+    assert.equal(loaded.config.filesystem.allowRead?.includes("."), true);
+    assert.equal(loaded.config.filesystem.allowRead?.includes("project-base"), false);
+    assert.equal(loaded.config.filesystem.allowRead?.includes("project-mode"), false);
+    assert.deepEqual(
+      loaded.projectRequests.readPaths.map((request) => request.canonicalPath),
+      [join(cwd, "project-base"), join(cwd, "project-mode")],
+    );
+    assert.equal(loaded.config.filesystem.denyWrite.includes("base.key"), true);
+    assert.equal(loaded.config.filesystem.denyWrite.includes("mode.key"), true);
+    assert.equal(loaded.config.network?.allowedDomains?.includes("project.example"), false);
+    assert.equal(loaded.config.network?.deniedDomains?.includes("blocked.example"), true);
+    assert.deepEqual(
+      loaded.projectRequests.domains.map((request) => request.domain),
+      ["project.example"],
+    );
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
 });
 
 test("untrusted project policy is not loaded", () => {
@@ -150,7 +173,7 @@ test("untrusted project policy is not loaded", () => {
       filesystem: { denyRead: ["private-marker"], allowRead: [], allowWrite: [], denyWrite: [] },
     }),
   );
-  const loaded = loadPolicy(cwd, "default", false);
+  const loaded = withIsolatedV2AgentDir(() => loadPolicy(cwd, "default", false));
   assert.equal(loaded.config.filesystem.denyRead.includes("private-marker"), false);
   assert.equal(loaded.projectTrusted, false);
 });
@@ -165,7 +188,7 @@ test("trusted project external allows become requests and powerful controls are 
       filesystem: { allowRead: ["/etc"], allowWrite: ["/var/out"], denyRead: [], denyWrite: [] },
     }),
   );
-  const loaded = loadPolicy(cwd, "default", true);
+  const loaded = withIsolatedV2AgentDir(() => loadPolicy(cwd, "default", true));
   assert.notEqual(loaded.config.enabled, false);
   assert.equal(loaded.config.filesystem.allowRead?.includes("/etc"), false);
   assert.equal(loaded.config.filesystem.allowWrite.includes("/var/out"), false);
@@ -187,7 +210,10 @@ test("project wildcard domain request is rejected", () => {
     join(cwd, ".pi", "sandbox.json"),
     JSON.stringify({ network: { allowedDomains: ["*"] } }),
   );
-  assert.throws(() => loadPolicy(cwd, "default", true), /cannot contain/);
+  assert.throws(
+    () => withIsolatedV2AgentDir(() => loadPolicy(cwd, "default", true)),
+    /cannot contain/,
+  );
 });
 
 test("request approvals are mode/root-bound and safely persisted", () => {
@@ -237,6 +263,30 @@ test("grant writers create version 2 policy files", () => {
   assert.deepEqual(written.filesystem.allowRead, ["/allowed"]);
 });
 
+test("grant writers preserve the nested v3 schema for global profiles", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-policy-write-"));
+  const configPath = join(cwd, "sandbox.audit.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      policyVersion: 3,
+      network: { allow: [], deny: [], otherwise: "deny" },
+      filesystem: {
+        read: { allow: [], deny: [], otherwise: "prompt" },
+        write: { allow: [], deny: [], otherwise: "deny" },
+      },
+    }),
+  );
+
+  addReadPathToConfig(configPath, "/read");
+  addWritePathToConfig(configPath, "/write");
+  const written = JSON.parse(readFileSync(configPath, "utf-8"));
+  assert.deepEqual(written.filesystem.read.allow, ["/read"]);
+  assert.deepEqual(written.filesystem.write.allow, ["/write"]);
+  assert.equal(written.filesystem.allowRead, undefined);
+  assert.equal(written.mode, undefined);
+});
+
 test("trusted grant writer refuses symlinked policy files", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-policy-write-"));
   const real = join(cwd, "real.json");
@@ -264,6 +314,78 @@ test("policy version 1 is rejected", () => {
     () => validateConfig({ policyVersion: 1 }, "test policy"),
     /policyVersion must be 2 or 3/,
   );
+});
+
+test("v3 normalizes nested allow, deny, and otherwise policies", () => {
+  const parsed = validateConfig(
+    {
+      policyVersion: 3,
+      network: { allow: ["github.com"], deny: ["blocked.example"], otherwise: "deny" },
+      filesystem: {
+        read: { scope: "strict", allow: ["/docs"], deny: ["/secret"], otherwise: "prompt" },
+        write: { allow: ["/tmp"], deny: ["/locked"], otherwise: "deny" },
+      },
+    },
+    "test v3 policy",
+  );
+
+  assert.deepEqual(parsed.otherwise, { read: "prompt", write: "deny", network: "deny" });
+  assert.deepEqual(parsed.network?.allowedDomains, ["github.com"]);
+  assert.deepEqual(parsed.network?.deniedDomains, ["blocked.example"]);
+  assert.equal(parsed.filesystem?.readScope, "strict");
+  assert.deepEqual(parsed.filesystem?.allowRead, ["/docs"]);
+  assert.deepEqual(parsed.filesystem?.denyRead, ["/secret"]);
+  assert.deepEqual(parsed.filesystem?.allowWrite, ["/tmp"]);
+  assert.deepEqual(parsed.filesystem?.denyWrite, ["/locked"]);
+});
+
+test("v3 rejects the obsolete inner mode block and v2 field names", () => {
+  assert.throws(
+    () =>
+      validateConfig(
+        {
+          policyVersion: 3,
+          mode: { read: "prompt", write: "prompt", network: "prompt" },
+        },
+        "test v3 policy",
+      ),
+    /inner mode block.*no longer supported/i,
+  );
+  assert.throws(
+    () =>
+      validateConfig(
+        { policyVersion: 3, network: { allowedDomains: ["github.com"] } },
+        "test v3 policy",
+      ),
+    /network\.allowedDomains.*use network\.allow/i,
+  );
+});
+
+test("v3 global base requires explicit otherwise actions", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-incomplete-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-incomplete-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        network: { allow: [], deny: [], otherwise: "deny" },
+        filesystem: {
+          read: { scope: "strict", allow: [], deny: [], otherwise: "prompt" },
+          write: { allow: [], deny: [] },
+        },
+      }),
+    );
+    assert.throws(
+      () => loadPolicy(cwd, "default", false),
+      /policyVersion 3 requires explicit filesystem\.write\.otherwise/,
+    );
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
 });
 
 test("global mode discovery returns arbitrary safe profile names", () => {
@@ -303,17 +425,17 @@ test("v3 global mode profiles replace present allows, inherit omitted allows, an
       denyWrite: ["/base-locked"],
     },
   };
-  const merged = applyGlobalModeProfile(base, {
-    policyVersion: 3,
-    mode: { read: "prompt", write: "prompt", network: "prompt" },
-    network: { allowedDomains: [], deniedDomains: ["mode-blocked.example"] },
-    filesystem: {
-      allowRead: [],
-      allowWrite: ["/tmp"],
-      denyRead: ["/mode-secret"],
-      denyWrite: [],
-    },
-  });
+  const merged = applyGlobalModeProfile(
+    base,
+    validateConfig({
+      policyVersion: 3,
+      network: { allow: [], deny: ["mode-blocked.example"], otherwise: "deny" },
+      filesystem: {
+        read: { allow: [], deny: ["/mode-secret"], otherwise: "prompt" },
+        write: { allow: ["/tmp"], deny: [], otherwise: "deny" },
+      },
+    }),
+  );
 
   assert.deepEqual(merged.network?.allowedDomains, []);
   assert.deepEqual(merged.network?.deniedDomains, ["base-blocked.example", "mode-blocked.example"]);
@@ -322,11 +444,13 @@ test("v3 global mode profiles replace present allows, inherit omitted allows, an
   assert.deepEqual(merged.filesystem.denyRead, ["/base-secret", "/mode-secret"]);
   assert.deepEqual(merged.filesystem.denyWrite, ["/base-locked"]);
 
-  const inherited = applyGlobalModeProfile(base, {
-    policyVersion: 3,
-    mode: { read: "prompt", write: "prompt", network: "prompt" },
-    filesystem: { denyRead: [], allowWrite: ["/mode-write"], denyWrite: [] },
-  });
+  const inherited = applyGlobalModeProfile(
+    base,
+    validateConfig({
+      policyVersion: 3,
+      filesystem: { write: { allow: ["/mode-write"], deny: [] } },
+    }),
+  );
   assert.deepEqual(inherited.filesystem.allowRead, [".", "/base-read"]);
   assert.deepEqual(inherited.network?.allowedDomains, ["base.example"]);
 });
@@ -341,14 +465,23 @@ test("v3 loads arbitrary named global modes with behavior and source provenance"
       join(agentDir, "sandbox.json"),
       JSON.stringify({
         policyVersion: 3,
-        mode: { read: "prompt", write: "prompt", network: "prompt" },
-        network: { allowedDomains: ["base.example"], deniedDomains: ["base-blocked.example"] },
+        network: {
+          allow: ["base.example"],
+          deny: ["base-blocked.example"],
+          otherwise: "prompt",
+        },
         filesystem: {
-          readScope: "home",
-          denyRead: ["/base-secret"],
-          allowRead: [".", "/base-read"],
-          allowWrite: [".", "/tmp"],
-          denyWrite: ["/base-locked"],
+          read: {
+            scope: "home",
+            allow: [".", "/base-read"],
+            deny: ["/base-secret"],
+            otherwise: "prompt",
+          },
+          write: {
+            allow: [".", "/tmp"],
+            deny: ["/base-locked"],
+            otherwise: "prompt",
+          },
         },
       }),
     );
@@ -357,13 +490,10 @@ test("v3 loads arbitrary named global modes with behavior and source provenance"
       modePath,
       JSON.stringify({
         policyVersion: 3,
-        mode: { read: "prompt", write: "deny", network: "deny" },
-        network: { allowedDomains: [], deniedDomains: ["mode-blocked.example"] },
+        network: { allow: ["audit.example"], deny: ["mode-blocked.example"], otherwise: "deny" },
         filesystem: {
-          denyRead: ["/mode-secret"],
-          allowRead: [],
-          allowWrite: ["/tmp"],
-          denyWrite: [],
+          read: { allow: [], deny: ["/mode-secret"] },
+          write: { allow: ["/tmp"], deny: [], otherwise: "deny" },
         },
       }),
     );
@@ -371,8 +501,16 @@ test("v3 loads arbitrary named global modes with behavior and source provenance"
     const loaded = loadPolicy(cwd, "audit", false);
     assert.equal(loaded.policyVersion, 3);
     assert.equal(loaded.modeName, "audit");
-    assert.deepEqual(loaded.modePolicy, { read: "prompt", write: "deny", network: "deny" });
-    assert.equal(loaded.modePolicySource, modePath);
+    assert.deepEqual(loaded.otherwisePolicy, {
+      read: "prompt",
+      write: "deny",
+      network: "deny",
+    });
+    assert.deepEqual(loaded.otherwisePolicySources, {
+      read: join(agentDir, "sandbox.json"),
+      write: modePath,
+      network: modePath,
+    });
     assert.deepEqual(loaded.config.filesystem.allowRead, []);
     assert.deepEqual(loaded.config.filesystem.allowWrite, ["/tmp"]);
     assert.deepEqual(loaded.config.filesystem.denyRead, [
@@ -380,7 +518,7 @@ test("v3 loads arbitrary named global modes with behavior and source provenance"
       "/base-secret",
       "/mode-secret",
     ]);
-    assert.deepEqual(loaded.config.network?.allowedDomains, []);
+    assert.deepEqual(loaded.config.network?.allowedDomains, ["audit.example"]);
     assert.equal(loaded.loadedConfigPaths.includes(modePath), true);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -424,13 +562,10 @@ test("v3 profiles still apply reactive project grants additively without removin
       join(agentDir, "sandbox.json"),
       JSON.stringify({
         policyVersion: 3,
-        mode: { read: "prompt", write: "prompt", network: "prompt" },
-        network: { allowedDomains: [], deniedDomains: ["blocked.example"] },
+        network: { allow: [], deny: ["blocked.example"], otherwise: "prompt" },
         filesystem: {
-          denyRead: ["/secret"],
-          allowRead: [],
-          allowWrite: [],
-          denyWrite: ["/locked"],
+          read: { scope: "strict", allow: [], deny: ["/secret"], otherwise: "prompt" },
+          write: { allow: [], deny: ["/locked"], otherwise: "prompt" },
         },
       }),
     );
@@ -470,23 +605,48 @@ test("project policy cannot define execution behavior", () => {
       join(agentDir, "sandbox.json"),
       JSON.stringify({
         policyVersion: 3,
-        mode: { read: "prompt", write: "deny", network: "deny" },
-        filesystem: { denyRead: [], allowRead: ["."], allowWrite: [], denyWrite: [] },
+        network: { allow: [], deny: [], otherwise: "deny" },
+        filesystem: {
+          read: { scope: "strict", allow: ["."], deny: [], otherwise: "prompt" },
+          write: { allow: [], deny: [], otherwise: "deny" },
+        },
       }),
     );
     writeFileSync(
       join(cwd, ".pi", "sandbox.json"),
       JSON.stringify({
         policyVersion: 3,
-        mode: "project-has-no-mode-authority",
-        filesystem: { denyWrite: ["project.lock"] },
+        filesystem: {
+          read: { allow: ["/requested-read"], otherwise: "deny" },
+          write: {
+            allow: ["/requested-write"],
+            deny: ["project.lock"],
+            otherwise: "prompt",
+          },
+        },
+        network: { allow: ["requested.example"], otherwise: "prompt" },
       }),
     );
 
     const loaded = loadPolicy(cwd, "default", true);
-    assert.deepEqual(loaded.modePolicy, { read: "prompt", write: "deny", network: "deny" });
-    assert.match(loaded.warnings.join("\n"), /Ignored unsupported project controls: mode/);
+    assert.deepEqual(loaded.otherwisePolicy, { read: "prompt", write: "deny", network: "deny" });
+    assert.match(
+      loaded.warnings.join("\n"),
+      /Ignored unsupported project controls: filesystem\.read\.otherwise, filesystem\.write\.otherwise, network\.otherwise/,
+    );
     assert.equal(loaded.config.filesystem.denyWrite.includes("project.lock"), true);
+    assert.deepEqual(
+      loaded.projectRequests.readPaths.map((request) => request.canonicalPath),
+      ["/requested-read"],
+    );
+    assert.deepEqual(
+      loaded.projectRequests.writePaths.map((request) => request.canonicalPath),
+      ["/requested-write"],
+    );
+    assert.deepEqual(
+      loaded.projectRequests.domains.map((request) => request.domain),
+      ["requested.example"],
+    );
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

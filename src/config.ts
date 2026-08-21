@@ -25,10 +25,14 @@ import {
   projectRequestManifestHash,
 } from "./access-requests.ts";
 import {
+  type CategoricalDenies,
   DEFAULT_MODE,
+  DEFAULT_OTHERWISE_POLICY,
+  getLegacyCategoricalDenies,
   getLegacyModePolicy,
-  type ModePolicy,
-  parseModePolicy,
+  NO_CATEGORICAL_DENIES,
+  type OtherwisePolicy,
+  parseOtherwiseAction,
   validateModeName,
 } from "./modes.ts";
 import { canonicalizePath } from "./policy.ts";
@@ -57,7 +61,8 @@ type SandboxNetworkConfig = NonNullable<SandboxConfig["network"]>;
 export type SandboxPolicyDocument = Omit<Partial<SandboxConfig>, "network" | "filesystem"> & {
   network?: Partial<SandboxNetworkConfig>;
   filesystem?: Partial<SandboxFilesystemConfig>;
-  mode?: ModePolicy;
+  /** Normalized from v3 per-capability `otherwise` fields; never written as a top-level field. */
+  otherwise?: Partial<OtherwisePolicy>;
 };
 
 export interface SandboxConfigPaths {
@@ -74,8 +79,10 @@ export type ConfigFileState = "loaded" | "not-found" | "not-trusted" | "not-appl
 export interface LoadedSandboxPolicy {
   policyVersion: 2 | 3;
   modeName: string;
-  modePolicy: ModePolicy;
-  modePolicySource: string;
+  otherwisePolicy: OtherwisePolicy;
+  otherwisePolicySources: Record<keyof OtherwisePolicy, string>;
+  /** Only preserves categorical built-in v2 behavior such as read-only mode. */
+  legacyCategoricalDenies: CategoricalDenies;
   loadedConfigPaths: string[];
   configFileStates: {
     globalBase: ConfigFileState;
@@ -132,7 +139,7 @@ function mergeList(base?: string[], override?: string[]): string[] | undefined {
 }
 
 export function deepMerge(base: SandboxConfig, overrides: SandboxPolicyDocument): SandboxConfig {
-  const { mode: _mode, ...configOverrides } = overrides;
+  const { otherwise: _otherwise, ...configOverrides } = overrides;
   const result = {
     ...base,
     ...configOverrides,
@@ -165,7 +172,7 @@ export function applyGlobalModeProfile(
   base: SandboxConfig,
   profile: SandboxPolicyDocument,
 ): SandboxConfig {
-  const { mode: _mode, ...configOverrides } = profile;
+  const { otherwise: _otherwise, ...configOverrides } = profile;
   const result = {
     ...base,
     ...configOverrides,
@@ -229,16 +236,7 @@ function assertDomainPattern(pattern: string, field: string): void {
   }
 }
 
-export function validateConfig(
-  value: unknown,
-  source = "sandbox configuration",
-  validateMode = true,
-): SandboxPolicyDocument {
-  if (!isRecord(value)) throw new Error(`${source}: expected a JSON object`);
-  if (value.policyVersion !== undefined && value.policyVersion !== 2 && value.policyVersion !== 3) {
-    throw new Error(`${source}: policyVersion must be 2 or 3`);
-  }
-  if (validateMode && value.mode !== undefined) parseModePolicy(value.mode, source);
+function validateCommonFields(value: Record<string, unknown>, source: string): void {
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error(`${source}: enabled must be boolean`);
   }
@@ -248,24 +246,39 @@ export function validateConfig(
   if (value.failClosed === false) {
     throw new Error(`${source}: failClosed=false is not supported; use --no-sandbox explicitly`);
   }
+}
+
+function validatePortableList(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  assertStringArray(value, field);
+  const bad = value.find(hasUnsupportedFilesystemGlob);
+  if (bad) {
+    throw new Error(
+      `${field} pattern "${bad}" is not portable; use a literal path or trailing /**`,
+    );
+  }
+  return value;
+}
+
+function validateDomainList(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  assertStringArray(value, field);
+  for (const pattern of value) assertDomainPattern(pattern, field);
+  return value;
+}
+
+function validateV2Config(value: Record<string, unknown>, source: string): SandboxPolicyDocument {
   const network = value.network;
   if (network !== undefined) {
     if (!isRecord(network)) throw new Error(`${source}: network must be an object`);
-    for (const field of ["allowedDomains", "deniedDomains"] as const) {
-      if (network[field] !== undefined) {
-        assertStringArray(network[field], `${source}: network.${field}`);
-        for (const pattern of network[field]) {
-          assertDomainPattern(pattern, `${source}: network.${field}`);
-        }
-      }
-    }
+    validateDomainList(network.allowedDomains, `${source}: network.allowedDomains`);
+    validateDomainList(network.deniedDomains, `${source}: network.deniedDomains`);
   }
   const filesystem = value.filesystem;
   if (filesystem !== undefined) {
     if (!isRecord(filesystem)) throw new Error(`${source}: filesystem must be an object`);
     for (const field of ["denyRead", "allowRead", "allowWrite", "denyWrite"] as const) {
-      if (filesystem[field] !== undefined)
-        assertStringArray(filesystem[field], `${source}: filesystem.${field}`);
+      validatePortableList(filesystem[field], `${source}: filesystem.${field}`);
     }
     if (
       filesystem.readScope !== undefined &&
@@ -273,24 +286,126 @@ export function validateConfig(
     ) {
       throw new Error(`${source}: filesystem.readScope must be home, strict, or open`);
     }
-    for (const field of ["denyRead", "allowRead", "allowWrite", "denyWrite"] as const) {
-      const bad = Array.isArray(filesystem[field])
-        ? (filesystem[field] as string[]).find(hasUnsupportedFilesystemGlob)
-        : undefined;
-      if (bad) {
-        throw new Error(
-          `${source}: filesystem.${field} pattern "${bad}" is not portable; use a literal path or trailing /**`,
-        );
-      }
-    }
   }
   return value as SandboxPolicyDocument;
 }
 
-function readJsonConfig(
-  configPath: string,
-  validateMode = true,
-): SandboxPolicyDocument | undefined {
+function validateV3Capability(
+  value: unknown,
+  field: string,
+  includeScope: boolean,
+): {
+  allow?: string[];
+  deny?: string[];
+  otherwise?: "prompt" | "deny";
+  scope?: ReadScope;
+} {
+  if (!isRecord(value)) throw new Error(`${field} must be an object`);
+  const supported = new Set(
+    includeScope ? ["allow", "deny", "otherwise", "scope"] : ["allow", "deny", "otherwise"],
+  );
+  const unsupported = Object.keys(value).find((key) => !supported.has(key));
+  if (unsupported) throw new Error(`${field}.${unsupported} is not supported`);
+  const allow = validatePortableList(value.allow, `${field}.allow`);
+  const deny = validatePortableList(value.deny, `${field}.deny`);
+  const otherwise =
+    value.otherwise === undefined
+      ? undefined
+      : parseOtherwiseAction(value.otherwise, `${field}.otherwise`);
+  const scope = value.scope;
+  if (scope !== undefined && !["home", "strict", "open"].includes(String(scope))) {
+    throw new Error(`${field}.scope must be home, strict, or open`);
+  }
+  return { allow, deny, otherwise, scope: scope as ReadScope | undefined };
+}
+
+function validateV3Config(value: Record<string, unknown>, source: string): SandboxPolicyDocument {
+  if (value.mode !== undefined) {
+    throw new Error(
+      `${source}: the inner mode block is no longer supported; use per-capability otherwise actions`,
+    );
+  }
+  const normalized = { ...value } as Record<string, unknown>;
+  const otherwise: Partial<OtherwisePolicy> = {};
+
+  const network = value.network;
+  if (network !== undefined) {
+    if (!isRecord(network)) throw new Error(`${source}: network must be an object`);
+    if (network.allowedDomains !== undefined) {
+      throw new Error(`${source}: network.allowedDomains is v2 syntax; use network.allow`);
+    }
+    if (network.deniedDomains !== undefined) {
+      throw new Error(`${source}: network.deniedDomains is v2 syntax; use network.deny`);
+    }
+    if (network.strictAllowlist !== undefined) {
+      throw new Error(`${source}: network.strictAllowlist is replaced by network.otherwise`);
+    }
+    const allow = validateDomainList(network.allow, `${source}: network.allow`);
+    const deny = validateDomainList(network.deny, `${source}: network.deny`);
+    if (network.otherwise !== undefined) {
+      otherwise.network = parseOtherwiseAction(network.otherwise, `${source}: network.otherwise`);
+    }
+    const { allow: _allow, deny: _deny, otherwise: _otherwise, ...runtimeNetwork } = network;
+    normalized.network = {
+      ...runtimeNetwork,
+      ...(allow === undefined ? {} : { allowedDomains: allow }),
+      ...(deny === undefined ? {} : { deniedDomains: deny }),
+    };
+  }
+
+  const filesystem = value.filesystem;
+  if (filesystem !== undefined) {
+    if (!isRecord(filesystem)) throw new Error(`${source}: filesystem must be an object`);
+    for (const oldField of ["readScope", "denyRead", "allowRead", "allowWrite", "denyWrite"]) {
+      if (filesystem[oldField] !== undefined) {
+        const replacement =
+          oldField === "readScope"
+            ? "filesystem.read.scope"
+            : oldField.endsWith("Read")
+              ? `filesystem.read.${oldField.startsWith("allow") ? "allow" : "deny"}`
+              : `filesystem.write.${oldField.startsWith("allow") ? "allow" : "deny"}`;
+        throw new Error(`${source}: filesystem.${oldField} is v2 syntax; use ${replacement}`);
+      }
+    }
+    const read =
+      filesystem.read === undefined
+        ? undefined
+        : validateV3Capability(filesystem.read, `${source}: filesystem.read`, true);
+    const write =
+      filesystem.write === undefined
+        ? undefined
+        : validateV3Capability(filesystem.write, `${source}: filesystem.write`, false);
+    if (read?.otherwise !== undefined) otherwise.read = read.otherwise;
+    if (write?.otherwise !== undefined) otherwise.write = write.otherwise;
+    const { read: _read, write: _write, ...runtimeFilesystem } = filesystem;
+    normalized.filesystem = {
+      ...runtimeFilesystem,
+      ...(read?.scope === undefined ? {} : { readScope: read.scope }),
+      ...(read?.allow === undefined ? {} : { allowRead: read.allow }),
+      ...(read?.deny === undefined ? {} : { denyRead: read.deny }),
+      ...(write?.allow === undefined ? {} : { allowWrite: write.allow }),
+      ...(write?.deny === undefined ? {} : { denyWrite: write.deny }),
+    };
+  }
+  normalized.otherwise = otherwise;
+  return normalized as SandboxPolicyDocument;
+}
+
+export function validateConfig(
+  value: unknown,
+  source = "sandbox configuration",
+): SandboxPolicyDocument {
+  if (!isRecord(value)) throw new Error(`${source}: expected a JSON object`);
+  if (value.policyVersion !== undefined && value.policyVersion !== 2 && value.policyVersion !== 3) {
+    throw new Error(`${source}: policyVersion must be 2 or 3`);
+  }
+  validateCommonFields(value, source);
+  return value.policyVersion === 3
+    ? validateV3Config(value, source)
+    : validateV2Config(value, source);
+}
+
+function readJsonConfig(configPath: string): SandboxPolicyDocument | undefined {
   if (!existsSync(configPath)) return undefined;
   let parsed: unknown;
   try {
@@ -298,7 +413,7 @@ function readJsonConfig(
   } catch (error) {
     throw new Error(`Could not parse ${configPath}: ${error}`);
   }
-  return validateConfig(parsed, configPath, validateMode);
+  return validateConfig(parsed, configPath);
 }
 
 function modeSuffix(mode: string): string {
@@ -358,8 +473,11 @@ export function splitProjectConfig(
     throw new Error(`${sourcePath}: project network.allowedDomains cannot contain "*"`);
   }
   const ignored = Object.keys(raw).filter(
-    (field) => !["policyVersion", "network", "filesystem"].includes(field),
+    (field) => !["policyVersion", "network", "filesystem", "otherwise"].includes(field),
   );
+  if (raw.otherwise?.read !== undefined) ignored.push("filesystem.read.otherwise");
+  if (raw.otherwise?.write !== undefined) ignored.push("filesystem.write.otherwise");
+  if (raw.otherwise?.network !== undefined) ignored.push("network.otherwise");
   for (const field of Object.keys(raw.network ?? {})) {
     if (!["allowedDomains", "deniedDomains"].includes(field)) ignored.push(`network.${field}`);
   }
@@ -495,53 +613,79 @@ export function readProjectRequestApproval(
   }
 }
 
-function resolveModeBehavior(
+function resolveOtherwisePolicy(
   mode: string,
   globalBase: SandboxPolicyDocument | undefined,
   globalMode: SandboxPolicyDocument | undefined,
   paths: SandboxConfigPaths,
-): { policy: ModePolicy; source: string; version: 2 | 3 } {
-  if (mode === DEFAULT_MODE) {
-    if (globalBase?.policyVersion === 3) {
-      if (!globalBase.mode) {
-        throw new Error(`${paths.globalBasePath}: policyVersion 3 requires an explicit mode block`);
+): {
+  policy: OtherwisePolicy;
+  sources: Record<keyof OtherwisePolicy, string>;
+  legacyCategoricalDenies: CategoricalDenies;
+  version: 2 | 3;
+} {
+  const legacy = getLegacyModePolicy(mode);
+  if (mode !== DEFAULT_MODE && !globalMode && (!legacy || globalBase?.policyVersion === 3)) {
+    throw new Error(
+      `Sandbox mode "${mode}" is not defined; create ${paths.globalModePath} with policyVersion 3`,
+    );
+  }
+  if (
+    mode !== DEFAULT_MODE &&
+    globalMode &&
+    globalMode.policyVersion !== 3 &&
+    (!legacy || globalBase?.policyVersion === 3)
+  ) {
+    throw new Error(`Custom mode "${mode}" requires policyVersion 3 in ${paths.globalModePath}`);
+  }
+
+  const initial =
+    globalBase?.policyVersion === 3 || globalMode?.policyVersion === 3
+      ? DEFAULT_OTHERWISE_POLICY
+      : (legacy ?? DEFAULT_OTHERWISE_POLICY);
+  const initialSource =
+    globalBase?.policyVersion === 3 || globalMode?.policyVersion === 3
+      ? "<built-in:v3-default>"
+      : `<built-in:v2-${legacy ? mode : DEFAULT_MODE}>`;
+  const policy = { ...initial };
+  const sources: Record<keyof OtherwisePolicy, string> = {
+    read: initialSource,
+    write: initialSource,
+    network: initialSource,
+  };
+
+  if (globalBase?.policyVersion === 3) {
+    for (const capability of ["read", "write", "network"] as const) {
+      const action = globalBase.otherwise?.[capability];
+      if (!action) {
+        const field =
+          capability === "network" ? "network.otherwise" : `filesystem.${capability}.otherwise`;
+        throw new Error(`${paths.globalBasePath}: policyVersion 3 requires explicit ${field}`);
       }
-      return {
-        policy: parseModePolicy(globalBase.mode, paths.globalBasePath),
-        source: paths.globalBasePath,
-        version: 3,
-      };
+      policy[capability] = action;
+      sources[capability] = paths.globalBasePath;
     }
-    return {
-      policy: getLegacyModePolicy(DEFAULT_MODE)!,
-      source: "<built-in:v2-default>",
-      version: 2,
-    };
   }
 
   if (globalMode?.policyVersion === 3) {
-    if (!globalMode.mode) {
-      throw new Error(`${paths.globalModePath}: policyVersion 3 requires an explicit mode block`);
+    for (const capability of ["read", "write", "network"] as const) {
+      const action = globalMode.otherwise?.[capability];
+      if (action) {
+        policy[capability] = action;
+        sources[capability] = paths.globalModePath ?? "global mode policy";
+      }
     }
-    return {
-      policy: parseModePolicy(globalMode.mode, paths.globalModePath ?? "global mode policy"),
-      source: paths.globalModePath ?? "global mode policy",
-      version: 3,
-    };
   }
 
-  const legacy = getLegacyModePolicy(mode);
-  if (legacy && globalBase?.policyVersion !== 3) {
-    return { policy: legacy, source: `<built-in:v2-${mode}>`, version: 2 };
-  }
-  if (!globalMode) {
-    throw new Error(
-      `Sandbox mode "${mode}" is not defined; create ${paths.globalModePath} with policyVersion 3 and an explicit mode block`,
-    );
-  }
-  throw new Error(
-    `Custom mode "${mode}" requires policyVersion 3 and an explicit mode block in ${paths.globalModePath}`,
-  );
+  const usesV3 = globalBase?.policyVersion === 3 || globalMode?.policyVersion === 3;
+  return {
+    policy,
+    sources,
+    legacyCategoricalDenies: usesV3
+      ? { ...NO_CATEGORICAL_DENIES }
+      : getLegacyCategoricalDenies(mode),
+    version: usesV3 ? 3 : 2,
+  };
 }
 
 export function loadPolicy(
@@ -554,15 +698,12 @@ export function loadPolicy(
   const paths = getConfigPaths(projectRoot, mode);
   const globalBase = readJsonConfig(paths.globalBasePath);
   const globalMode = paths.globalModePath ? readJsonConfig(paths.globalModePath) : undefined;
-  const projectBase = projectTrusted ? readJsonConfig(paths.projectBasePath, false) : undefined;
+  const projectBase = projectTrusted ? readJsonConfig(paths.projectBasePath) : undefined;
   const projectMode =
-    projectTrusted && paths.projectModePath
-      ? readJsonConfig(paths.projectModePath, false)
-      : undefined;
+    projectTrusted && paths.projectModePath ? readJsonConfig(paths.projectModePath) : undefined;
   const projectGrant = readJsonConfig(paths.projectGrantPath);
-  const modeBehavior = resolveModeBehavior(mode, globalBase, globalMode, paths);
-  const policyVersion: 2 | 3 =
-    modeBehavior.version === 3 || globalBase?.policyVersion === 3 ? 3 : 2;
+  const otherwiseResolution = resolveOtherwisePolicy(mode, globalBase, globalMode, paths);
+  const policyVersion = otherwiseResolution.version;
   let config: SandboxConfig = structuredClone(DEFAULT_CONFIG);
   const warnings: string[] = [];
   if (globalBase) {
@@ -623,8 +764,9 @@ export function loadPolicy(
   return {
     policyVersion,
     modeName: mode,
-    modePolicy: modeBehavior.policy,
-    modePolicySource: modeBehavior.source,
+    otherwisePolicy: otherwiseResolution.policy,
+    otherwisePolicySources: otherwiseResolution.sources,
+    legacyCategoricalDenies: otherwiseResolution.legacyCategoricalDenies,
     loadedConfigPaths,
     configFileStates: {
       globalBase: globalBase ? "loaded" : "not-found",
@@ -680,8 +822,23 @@ function writeJsonFile(configPath: string, value: unknown): void {
   }
 }
 
-function readWritableConfig(configPath: string): SandboxPolicyDocument {
-  return readJsonConfig(configPath) ?? { policyVersion: 2 };
+function readWritableConfig(configPath: string): Record<string, unknown> {
+  if (!existsSync(configPath)) return { policyVersion: 2 };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(configPath, "utf-8"));
+  } catch (error) {
+    throw new Error(`Could not parse ${configPath}: ${error}`);
+  }
+  validateConfig(parsed, configPath);
+  if (!isRecord(parsed)) throw new Error(`${configPath}: expected a JSON object`);
+  return parsed;
+}
+
+function writableStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
 }
 
 export function writeProjectRequestApproval(
@@ -718,39 +875,62 @@ export function writeProjectRequestApproval(
 
 export function addDomainToConfig(configPath: string, domain: string): void {
   const config = readWritableConfig(configPath);
-  const existing = config.network?.allowedDomains ?? [];
+  const network = isRecord(config.network) ? config.network : {};
+  const field = config.policyVersion === 3 ? "allow" : "allowedDomains";
+  const existing = writableStringArray(network[field]);
   if (existing.includes(domain)) return;
   config.network = {
-    ...config.network,
-    allowedDomains: [...existing, domain],
-    deniedDomains: config.network?.deniedDomains ?? [],
+    ...network,
+    [field]: [...existing, domain],
+    ...(config.policyVersion === 3
+      ? {}
+      : { deniedDomains: writableStringArray(network.deniedDomains) }),
   };
+  validateConfig(config, configPath);
   writeJsonFile(configPath, config);
 }
 
 export function addReadPathToConfig(configPath: string, pathToAdd: string): void {
   const config = readWritableConfig(configPath);
-  const existing = config.filesystem?.allowRead ?? [];
-  if (existing.includes(pathToAdd)) return;
-  config.filesystem = {
-    ...config.filesystem,
-    allowRead: [...existing, pathToAdd],
-    denyRead: config.filesystem?.denyRead ?? [],
-    allowWrite: config.filesystem?.allowWrite ?? [],
-    denyWrite: config.filesystem?.denyWrite ?? [],
-  };
+  const filesystem = isRecord(config.filesystem) ? config.filesystem : {};
+  if (config.policyVersion === 3) {
+    const read = isRecord(filesystem.read) ? filesystem.read : {};
+    const existing = writableStringArray(read.allow);
+    if (existing.includes(pathToAdd)) return;
+    config.filesystem = { ...filesystem, read: { ...read, allow: [...existing, pathToAdd] } };
+  } else {
+    const existing = writableStringArray(filesystem.allowRead);
+    if (existing.includes(pathToAdd)) return;
+    config.filesystem = {
+      ...filesystem,
+      allowRead: [...existing, pathToAdd],
+      denyRead: writableStringArray(filesystem.denyRead),
+      allowWrite: writableStringArray(filesystem.allowWrite),
+      denyWrite: writableStringArray(filesystem.denyWrite),
+    };
+  }
+  validateConfig(config, configPath);
   writeJsonFile(configPath, config);
 }
 
 export function addWritePathToConfig(configPath: string, pathToAdd: string): void {
   const config = readWritableConfig(configPath);
-  const existing = config.filesystem?.allowWrite ?? [];
-  if (existing.includes(pathToAdd)) return;
-  config.filesystem = {
-    ...config.filesystem,
-    allowWrite: [...existing, pathToAdd],
-    denyRead: config.filesystem?.denyRead ?? [],
-    denyWrite: config.filesystem?.denyWrite ?? [],
-  };
+  const filesystem = isRecord(config.filesystem) ? config.filesystem : {};
+  if (config.policyVersion === 3) {
+    const write = isRecord(filesystem.write) ? filesystem.write : {};
+    const existing = writableStringArray(write.allow);
+    if (existing.includes(pathToAdd)) return;
+    config.filesystem = { ...filesystem, write: { ...write, allow: [...existing, pathToAdd] } };
+  } else {
+    const existing = writableStringArray(filesystem.allowWrite);
+    if (existing.includes(pathToAdd)) return;
+    config.filesystem = {
+      ...filesystem,
+      allowWrite: [...existing, pathToAdd],
+      denyRead: writableStringArray(filesystem.denyRead),
+      denyWrite: writableStringArray(filesystem.denyWrite),
+    };
+  }
+  validateConfig(config, configPath);
   writeJsonFile(configPath, config);
 }

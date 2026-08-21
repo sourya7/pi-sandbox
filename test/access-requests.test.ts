@@ -16,13 +16,7 @@ import {
   type ProjectRequestApproval,
 } from "../src/access-requests.ts";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
-import { getLegacyModePolicy } from "../src/modes.ts";
-
-function getModePolicy(mode: string) {
-  const policy = getLegacyModePolicy(mode);
-  assert.ok(policy, `expected legacy test mode ${mode}`);
-  return policy;
-}
+import { getLegacyCategoricalDenies } from "../src/modes.ts";
 
 function declaration(value: string, sourcePath = ".pi/sandbox.json") {
   return { value, sourcePath, sourceKind: "project-base" as const };
@@ -71,7 +65,7 @@ function classify(
     config: options.config ?? strictConfig(),
     projectRoot,
     mode,
-    modePolicy: getModePolicy(mode),
+    legacyCategoricalDenies: getLegacyCategoricalDenies(mode),
     protectedWritePaths: options.protectedWritePaths ?? [],
     approval: options.approval,
   });
@@ -153,7 +147,7 @@ test("hard denies and read-only mode outrank approvals", () => {
     config,
     projectRoot: root,
     mode: "read-only",
-    modePolicy: getModePolicy("read-only"),
+    legacyCategoricalDenies: getLegacyCategoricalDenies("read-only"),
     protectedWritePaths: [],
     approval,
   });
@@ -185,7 +179,7 @@ test("unchanged and narrower requests reuse approval without broadening active a
     config: strictConfig(),
     projectRoot: root,
     mode: "default",
-    modePolicy: getModePolicy("default"),
+    legacyCategoricalDenies: getLegacyCategoricalDenies("default"),
     protectedWritePaths: [],
     approval,
   });
@@ -211,7 +205,7 @@ test("approval reconciliation drops removed capabilities and leaves expansions p
     config: strictConfig(),
     projectRoot: root,
     mode: "default",
-    modePolicy: getModePolicy("default"),
+    legacyCategoricalDenies: getLegacyCategoricalDenies("default"),
     protectedWritePaths: [],
     approval,
   });
@@ -243,7 +237,7 @@ test("approved write implies read approval while protected paths remain denied",
     config: strictConfig(),
     projectRoot: root,
     mode: "default",
-    modePolicy: getModePolicy("default"),
+    legacyCategoricalDenies: getLegacyCategoricalDenies("default"),
     protectedWritePaths: [external],
     approval,
   });

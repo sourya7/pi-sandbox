@@ -420,14 +420,10 @@ test("v3 custom mode behavior drives runtime and exact tool enforcement", async 
     join(agentDir, "sandbox.json"),
     JSON.stringify({
       policyVersion: 3,
-      mode: { read: "prompt", write: "prompt", network: "prompt" },
-      network: { allowedDomains: ["base.example"], deniedDomains: [] },
+      network: { allow: ["base.example"], deny: [], otherwise: "prompt" },
       filesystem: {
-        readScope: "strict",
-        denyRead: [],
-        allowRead: ["."],
-        allowWrite: ["."],
-        denyWrite: [],
+        read: { scope: "strict", allow: ["."], deny: [], otherwise: "prompt" },
+        write: { allow: ["."], deny: [], otherwise: "prompt" },
       },
     }),
   );
@@ -435,15 +431,26 @@ test("v3 custom mode behavior drives runtime and exact tool enforcement", async 
     join(agentDir, "sandbox.audit.json"),
     JSON.stringify({
       policyVersion: 3,
-      mode: { read: "prompt", write: "deny", network: "deny" },
-      network: { allowedDomains: [], deniedDomains: [] },
-      filesystem: { denyRead: [], allowRead: [], allowWrite: ["/tmp"], denyWrite: [] },
+      network: { allow: ["audit.example"], deny: [], otherwise: "deny" },
+      filesystem: {
+        read: { allow: [], deny: [], otherwise: "prompt" },
+        write: { allow: ["/tmp"], deny: [], otherwise: "deny" },
+      },
     }),
   );
   let runtimeConfig: SandboxRuntimeConfig | undefined;
-  t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
-    runtimeConfig = config;
-  });
+  let networkCallback: ((request: { host: string }) => Promise<boolean>) | undefined;
+  t.mock.method(
+    SandboxManager,
+    "initialize",
+    async (
+      config: SandboxRuntimeConfig,
+      callback: (request: { host: string }) => Promise<boolean>,
+    ) => {
+      runtimeConfig = config;
+      networkCallback = callback;
+    },
+  );
 
   const events: string[] = [];
   const notifications: string[] = [];
@@ -462,28 +469,46 @@ test("v3 custom mode behavior drives runtime and exact tool enforcement", async 
     await emit(harness, "session_start", { reason: "startup" }, ctx);
 
     assert.ok(runtimeConfig);
-    assert.deepEqual(runtimeConfig.network?.allowedDomains, []);
-    assert.deepEqual(runtimeConfig.filesystem?.allowWrite, []);
+    assert.deepEqual(runtimeConfig.network?.allowedDomains, ["audit.example"]);
+    assert.equal(runtimeConfig.network?.strictAllowlist, true);
+    assert.deepEqual(runtimeConfig.filesystem?.allowWrite, ["/tmp"]);
+    assert.ok(networkCallback);
+    assert.equal(await networkCallback({ host: "audit.example" }), true);
+    assert.equal(await networkCallback({ host: "unlisted.example" }), false);
 
     const toolCall = harness.handlers.get("tool_call")?.[0];
     assert.ok(toolCall);
     const blocked = (await toolCall(
-      { type: "tool_call", toolName: "write", input: { path: "output.txt", content: "x" } },
+      {
+        type: "tool_call",
+        toolName: "write",
+        input: { path: join(homedir(), "audit-output.txt"), content: "x" },
+      },
       ctx,
     )) as any;
     assert.equal(blocked.block, true);
-    assert.match(blocked.reason, /mode "audit" denies writes/);
+    assert.match(blocked.reason, /denies unlisted writes/);
+
+    const listed = await toolCall(
+      { type: "tool_call", toolName: "write", input: { path: "/tmp/output.txt", content: "x" } },
+      ctx,
+    );
+    assert.equal(listed, undefined);
 
     const requestTool = harness.tools.get("request_sandbox_access");
     assert.ok(requestTool);
     const denied = await requestTool.execute(
       "request-v3",
-      { operation: "write", path: "output.txt", reason: "test mode deny" },
+      {
+        operation: "write",
+        path: join(homedir(), "audit-request-output.txt"),
+        reason: "test otherwise deny",
+      },
       undefined,
       undefined,
       ctx,
     );
-    assert.match(denied.content[0].text, /mode "audit" denies writes/);
+    assert.match(denied.content[0].text, /denies unlisted writes/);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -501,14 +526,10 @@ test("failed dynamic mode switches preserve the active runtime and policy snapsh
     join(agentDir, "sandbox.json"),
     JSON.stringify({
       policyVersion: 3,
-      mode: { read: "prompt", write: "prompt", network: "prompt" },
-      network: { allowedDomains: [], deniedDomains: [] },
+      network: { allow: [], deny: [], otherwise: "prompt" },
       filesystem: {
-        readScope: "strict",
-        denyRead: [],
-        allowRead: ["."],
-        allowWrite: ["."],
-        denyWrite: [],
+        read: { scope: "strict", allow: ["."], deny: [], otherwise: "prompt" },
+        write: { allow: ["."], deny: [], otherwise: "prompt" },
       },
     }),
   );
@@ -544,7 +565,7 @@ test("failed dynamic mode switches preserve the active runtime and policy snapsh
     await harness.commands.get("sandbox-mode")?.handler("", ctx);
     assert.equal(notifications.at(-1), "Active sandbox mode: default");
     await harness.commands.get("sandbox")?.handler("", ctx);
-    assert.match(notifications.at(-1) ?? "", /Mode behavior source: .*sandbox\.json/);
+    assert.match(notifications.at(-1) ?? "", /Otherwise sources:.*sandbox\.json/s);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

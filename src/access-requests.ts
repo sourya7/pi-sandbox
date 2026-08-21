@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { type SandboxConfig } from "./config.ts";
-import { type ModePolicy } from "./modes.ts";
+import { type CategoricalDenies, NO_CATEGORICAL_DENIES } from "./modes.ts";
 import {
   canonicalizePath,
   domainMatchesPattern,
@@ -204,11 +204,18 @@ export function classifyProjectAccessRequests(input: {
   config: SandboxConfig;
   projectRoot: string;
   mode: string;
-  modePolicy: ModePolicy;
+  legacyCategoricalDenies?: CategoricalDenies;
   protectedWritePaths: string[];
   approval?: ProjectRequestApproval;
 }): ProjectRequestState {
-  const { requests, config, projectRoot, modePolicy, protectedWritePaths, approval } = input;
+  const {
+    requests,
+    config,
+    projectRoot,
+    legacyCategoricalDenies = NO_CATEGORICAL_DENIES,
+    protectedWritePaths,
+    approval,
+  } = input;
   const directReads = resolvePolicyPatterns(
     [...(config.filesystem.allowRead ?? []), ...config.filesystem.allowWrite],
     projectRoot,
@@ -230,12 +237,13 @@ export function classifyProjectAccessRequests(input: {
       readScope: config.filesystem.readScope ?? "home",
       denyRead: hardReads,
       allowRead: directReads,
-      modeBehavior: modePolicy.read,
+      otherwise: "prompt",
+      legacyCategoricalDeny: legacyCategoricalDenies.read,
     });
     const status: RequestStatus =
       decision === "hard-deny"
         ? "hard-denied"
-        : decision === "mode-deny"
+        : decision === "legacy-mode-deny"
           ? "mode-denied"
           : decision === "allow" || decision === "outside-scope-allow"
             ? "already-allowed"
@@ -254,7 +262,7 @@ export function classifyProjectAccessRequests(input: {
     );
     const status: RequestStatus = hardDenied
       ? "hard-denied"
-      : modePolicy.write === "deny"
+      : legacyCategoricalDenies.write
         ? "mode-denied"
         : matchesPattern(path, directWrites, projectRoot)
           ? "already-allowed"
@@ -269,7 +277,7 @@ export function classifyProjectAccessRequests(input: {
   const domains: ClassifiedDomainRequest[] = requests.domains.map((request) => {
     const status: RequestStatus = domainDenied(request.domain, deniedDomains)
       ? "hard-denied"
-      : modePolicy.network === "deny"
+      : legacyCategoricalDenies.network
         ? "mode-denied"
         : approvedDomain(request.domain, directDomains)
           ? "already-allowed"

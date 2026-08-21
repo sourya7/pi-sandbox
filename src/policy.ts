@@ -2,7 +2,13 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 
-export type PathDecision = "hard-deny" | "mode-deny" | "allow" | "prompt" | "outside-scope-allow";
+export type PathDecision =
+  | "hard-deny"
+  | "legacy-mode-deny"
+  | "unlisted-deny"
+  | "allow"
+  | "prompt"
+  | "outside-scope-allow";
 
 export interface ReadPolicyInput {
   path: string;
@@ -10,7 +16,8 @@ export interface ReadPolicyInput {
   readScope: "home" | "strict" | "open";
   denyRead: string[];
   allowRead: string[];
-  modeBehavior: "prompt" | "deny";
+  otherwise: "prompt" | "deny";
+  legacyCategoricalDeny?: boolean;
 }
 
 export function shouldPromptForWrite(
@@ -126,7 +133,7 @@ export function evaluateReadPolicy(input: ReadPolicyInput): PathDecision {
   const lexicalPath = resolveLexicalPath(input.path, input.cwd);
   const path = canonicalizePath(lexicalPath, input.cwd);
   if (matchesPattern(path, input.denyRead, input.cwd)) return "hard-deny";
-  if (input.modeBehavior === "deny") return "mode-deny";
+  if (input.legacyCategoricalDeny) return "legacy-mode-deny";
   if (matchesPattern(path, input.allowRead, input.cwd)) return "allow";
 
   if (input.readScope === "open") return "outside-scope-allow";
@@ -137,7 +144,7 @@ export function evaluateReadPolicy(input: ReadPolicyInput): PathDecision {
   ) {
     return "outside-scope-allow";
   }
-  return "prompt";
+  return input.otherwise === "deny" ? "unlisted-deny" : "prompt";
 }
 
 /** Return hard-deny patterns at or below a recursive operation root. */

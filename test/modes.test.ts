@@ -2,7 +2,7 @@ import test from "node:test";
 
 import assert from "node:assert/strict";
 
-import { getLegacyModePolicy, parseModePolicy, validateModeName } from "../src/modes.ts";
+import { getLegacyModePolicy, parseOtherwiseAction, validateModeName } from "../src/modes.ts";
 
 test("mode names accept arbitrary safe profile names", () => {
   for (const name of ["default", "restricted", "read-only", "audit_2"]) {
@@ -16,33 +16,16 @@ test("mode names reject empty names and path-like input", () => {
   }
 });
 
-test("mode behavior requires explicit prompt or deny values", () => {
-  assert.deepEqual(
-    parseModePolicy({ read: "prompt", write: "deny", network: "prompt" }, "test mode"),
-    { read: "prompt", write: "deny", network: "prompt" },
+test("otherwise actions accept only prompt or deny", () => {
+  assert.equal(parseOtherwiseAction("prompt", "filesystem.read.otherwise"), "prompt");
+  assert.equal(parseOtherwiseAction("deny", "network.otherwise"), "deny");
+  assert.throws(
+    () => parseOtherwiseAction("allow", "filesystem.write.otherwise"),
+    /filesystem\.write\.otherwise must be prompt or deny/,
   );
   assert.throws(
-    () => parseModePolicy({ read: "prompt", write: "allow", network: "prompt" }, "test mode"),
-    /test mode: mode.write must be prompt or deny/,
-  );
-  assert.throws(
-    () => parseModePolicy({ read: "prompt", write: "deny" }, "test mode"),
-    /test mode: mode.network must be prompt or deny/,
-  );
-  assert.throws(
-    () =>
-      parseModePolicy(
-        { read: "prompt", write: "deny", network: "prompt", typo: "deny" },
-        "test mode",
-      ),
-    /test mode: unsupported mode field typo/,
-  );
-});
-
-test("read deny requires write deny because writes imply reads", () => {
-  assert.throws(
-    () => parseModePolicy({ read: "deny", write: "prompt", network: "deny" }, "test mode"),
-    /read deny requires write deny/,
+    () => parseOtherwiseAction(undefined, "network.otherwise"),
+    /network\.otherwise must be prompt or deny/,
   );
 });
 

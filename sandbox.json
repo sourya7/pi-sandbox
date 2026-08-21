@@ -1,16 +1,11 @@
 {
   "policyVersion": 3,
-  "mode": {
-    "read": "prompt",
-    "write": "prompt",
-    "network": "prompt"
-  },
   "enabled": true,
   "failClosed": true,
   "network": {
     "allowLocalBinding": true,
     "allowAllUnixSockets": false,
-    "allowedDomains": [
+    "allow": [
       "localhost",
       "127.0.0.1",
       "html.duckduckgo.com",
@@ -23,35 +18,42 @@
       "pypi.org",
       "*.pypi.org"
     ],
-    "deniedDomains": []
+    "deny": [],
+    "otherwise": "prompt"
   },
   "filesystem": {
-    "readScope": "home",
-    "denyRead": [
-      ".env",
-      ".env.local",
-      ".env.development",
-      ".env.production",
-      ".env.test",
-      "~/.ssh",
-      "~/.aws",
-      "~/.kube",
-      "~/.config/gcloud",
-      "~/.pi/agent/auth.json",
-      "~/.pi/agent/sessions",
-      "~/.pi/agent/archive.db"
-    ],
-    "allowRead": [
-      "."
-    ],
-    "allowWrite": [
-      ".",
-      "/tmp",
-      "~/.cache/uv"
-    ],
-    "denyWrite": [
-      "~/.pi/agent/settings.json",
-      "~/.pi/agent/trust.json"
-    ]
+    "read": {
+      "scope": "home",
+      "allow": [
+        "."
+      ],
+      "deny": [
+        ".env",
+        ".env.local",
+        ".env.development",
+        ".env.production",
+        ".env.test",
+        "~/.ssh",
+        "~/.aws",
+        "~/.kube",
+        "~/.config/gcloud",
+        "~/.pi/agent/auth.json",
+        "~/.pi/agent/sessions",
+        "~/.pi/agent/archive.db"
+      ],
+      "otherwise": "prompt"
+    },
+    "write": {
+      "allow": [
+        ".",
+        "/tmp",
+        "~/.cache/uv"
+      ],
+      "deny": [
+        "~/.pi/agent/settings.json",
+        "~/.pi/agent/trust.json"
+      ],
+      "otherwise": "prompt"
+    }
   }
 }

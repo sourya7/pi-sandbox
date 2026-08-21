@@ -32,7 +32,13 @@ import {
   type LoadedSandboxPolicy,
   writeProjectRequestApproval,
 } from "./config.ts";
-import { DEFAULT_MODE, DEFAULT_MODE_POLICY, type ModePolicy } from "./modes.ts";
+import {
+  type CategoricalDenies,
+  DEFAULT_MODE,
+  DEFAULT_OTHERWISE_POLICY,
+  NO_CATEGORICAL_DENIES,
+  type OtherwisePolicy,
+} from "./modes.ts";
 import {
   canonicalizePath,
   domainIsAllowed,
@@ -231,8 +237,12 @@ export default function (pi: ExtensionAPI) {
     return policy;
   }
 
-  function activeModePolicy(): ModePolicy {
-    return policy?.modePolicy ?? DEFAULT_MODE_POLICY;
+  function activeOtherwisePolicy(): OtherwisePolicy {
+    return policy?.otherwisePolicy ?? DEFAULT_OTHERWISE_POLICY;
+  }
+
+  function activeLegacyCategoricalDenies(): CategoricalDenies {
+    return policy?.legacyCategoricalDenies ?? NO_CATEGORICAL_DENIES;
   }
 
   function effectiveConfig() {
@@ -278,7 +288,7 @@ export default function (pi: ExtensionAPI) {
       config: loaded.config,
       projectRoot: loaded.projectRoot,
       mode: activeMode,
-      modePolicy: loaded.modePolicy,
+      legacyCategoricalDenies: loaded.legacyCategoricalDenies,
       protectedWritePaths: loaded.protectedWritePaths,
       approval: loaded.projectRequestApproval,
     });
@@ -300,7 +310,7 @@ export default function (pi: ExtensionAPI) {
       config: loaded.config,
       projectRoot: loaded.projectRoot,
       mode: activeMode,
-      modePolicy: loaded.modePolicy,
+      legacyCategoricalDenies: loaded.legacyCategoricalDenies,
       protectedWritePaths: loaded.protectedWritePaths,
       approval: loaded.projectRequestApproval,
     });
@@ -382,7 +392,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function effectiveWritePaths(): string[] {
-    if (activeModePolicy().write === "deny") return [];
+    if (activeLegacyCategoricalDenies().write) return [];
     const config = effectiveConfig();
     const overridePaths = overrideAllowances(getModeOverrides());
     return resolvePolicyPatterns(
@@ -398,22 +408,28 @@ export default function (pi: ExtensionAPI) {
 
   function runtimeConfigForActiveMode() {
     const config = effectiveConfig();
-    const modePolicy = activeModePolicy();
+    const categorical = activeLegacyCategoricalDenies();
+    const v3StrictAllowlist =
+      policy?.policyVersion === 3 ? activeOtherwisePolicy().network === "deny" : undefined;
     if (
-      modePolicy.read !== "deny" &&
-      modePolicy.write !== "deny" &&
-      modePolicy.network !== "deny"
+      !categorical.read &&
+      !categorical.write &&
+      !categorical.network &&
+      v3StrictAllowlist === undefined
     ) {
       return config;
     }
     return {
       ...config,
-      network:
-        modePolicy.network === "deny" ? { ...config.network, allowedDomains: [] } : config.network,
+      network: {
+        ...config.network,
+        ...(categorical.network ? { allowedDomains: [] } : {}),
+        ...(v3StrictAllowlist === undefined ? {} : { strictAllowlist: v3StrictAllowlist }),
+      },
       filesystem: {
         ...config.filesystem,
-        allowRead: modePolicy.read === "deny" ? [] : config.filesystem.allowRead,
-        allowWrite: modePolicy.write === "deny" ? [] : config.filesystem.allowWrite,
+        allowRead: categorical.read ? [] : config.filesystem.allowRead,
+        allowWrite: categorical.write ? [] : config.filesystem.allowWrite,
       },
     };
   }
@@ -431,11 +447,11 @@ export default function (pi: ExtensionAPI) {
         ...new Set([...session.writePaths, ...overrides.writePaths, ...declared.writePaths]),
       ],
     };
-    const modePolicy = activeModePolicy();
+    const categorical = activeLegacyCategoricalDenies();
     return {
-      domains: modePolicy.network === "deny" ? [] : allowances.domains,
-      readPaths: modePolicy.read === "deny" ? [] : allowances.readPaths,
-      writePaths: modePolicy.write === "deny" ? [] : allowances.writePaths,
+      domains: categorical.network ? [] : allowances.domains,
+      readPaths: categorical.read ? [] : allowances.readPaths,
+      writePaths: categorical.write ? [] : allowances.writePaths,
     };
   }
 
@@ -450,7 +466,8 @@ export default function (pi: ExtensionAPI) {
           activeMode,
           state,
           getModeOverrides().length,
-          activeModePolicy(),
+          activeOtherwisePolicy(),
+          activeLegacyCategoricalDenies(),
         ),
       ),
     );
@@ -485,7 +502,7 @@ export default function (pi: ExtensionAPI) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
       state = "active";
-      if (loaded.modePolicy.network !== "deny") warnIfAllDomainsAllowed(ctx, loaded.config);
+      if (!loaded.legacyCategoricalDenies.network) warnIfAllDomainsAllowed(ctx, loaded.config);
       updateStatus(ctx);
       return true;
     } catch (error) {
@@ -578,17 +595,20 @@ export default function (pi: ExtensionAPI) {
 
   async function handleRuntimeBlockedDomain(host: string, cwd: string): Promise<boolean> {
     const loaded = requirePolicy();
-    if (loaded.modePolicy.network === "deny") return false;
+    if (loaded.legacyCategoricalDenies.network) return false;
     const allowed = [
       ...(loaded.config.network.allowedDomains ?? []),
       ...getModeAllowances().domains,
       ...declaredAllowances().domains,
     ];
     if (domainIsAllowed(host, allowed)) return true;
+    if (activeOtherwisePolicy().network === "deny") return false;
     const existing = pendingDomainPrompts.get(host);
     if (existing) return existing;
     const prompt = (async () => {
-      if (activeModePolicy().network === "deny") return false;
+      if (activeLegacyCategoricalDenies().network || activeOtherwisePolicy().network === "deny") {
+        return false;
+      }
       const ctx = activeToolCtx ?? activeCtx;
       if (!ctx) return false;
       const choice = await promptDomainBlock(ctx, host);
@@ -625,7 +645,8 @@ export default function (pi: ExtensionAPI) {
       readScope: config.filesystem.readScope ?? "home",
       denyRead: structuredHardReadPatterns(),
       allowRead: effectiveReadPaths(),
-      modeBehavior: activeModePolicy().read,
+      otherwise: activeOtherwisePolicy().read,
+      legacyCategoricalDeny: activeLegacyCategoricalDenies().read,
     });
   }
 
@@ -688,7 +709,13 @@ export default function (pi: ExtensionAPI) {
 
         if (violation.type === "read") {
           const decision = readDecision(violation.path, ctx.cwd);
-          if (decision === "hard-deny" || decision === "mode-deny") return result;
+          if (
+            decision === "hard-deny" ||
+            decision === "legacy-mode-deny" ||
+            decision === "unlisted-deny"
+          ) {
+            return result;
+          }
           // Only macOS Seatbelt supplies attributable read-denial events.
           if (process.platform === "darwin") {
             const choice = await promptReadBlock(ctx, violation.path);
@@ -700,7 +727,11 @@ export default function (pi: ExtensionAPI) {
             }
           }
         } else if (violation.type === "write") {
-          if (isHardWriteDenied(violation.path, ctx.cwd) || activeModePolicy().write === "deny") {
+          if (
+            isHardWriteDenied(violation.path, ctx.cwd) ||
+            activeLegacyCategoricalDenies().write ||
+            activeOtherwisePolicy().write === "deny"
+          ) {
             return result;
           }
           const choice = await promptWriteBlock(ctx, violation.path);
@@ -729,17 +760,36 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (state !== "active") return textResult(`Sandbox is ${state}; access cannot be granted.`);
       const path = canonicalizePath(params.path, ctx.cwd);
-      if (params.operation === "read" && readDecision(path, ctx.cwd) === "hard-deny") {
-        return textResult(
-          `Denied: "${path}" is covered by denyRead and cannot be granted interactively.`,
-        );
+      if (params.operation === "read") {
+        const decision = readDecision(path, ctx.cwd);
+        if (decision === "hard-deny") {
+          return textResult(
+            `Denied: "${path}" is covered by denyRead and cannot be granted interactively.`,
+          );
+        }
+        if (decision === "allow" || decision === "outside-scope-allow") {
+          return textResult(`Read access to "${path}" is already allowed.`);
+        }
+        if (decision === "legacy-mode-deny") {
+          return textResult(`Denied: legacy sandbox mode "${activeMode}" denies reads.`);
+        }
+        if (decision === "unlisted-deny") {
+          return textResult(`Denied: the active policy denies unlisted reads.`);
+        }
       }
-      if (params.operation === "write" && isHardWriteDenied(path, ctx.cwd)) {
-        return textResult(`Denied: "${path}" is covered by a hard write deny.`);
-      }
-      const behavior = activeModePolicy()[params.operation];
-      if (behavior === "deny") {
-        return textResult(`Denied: sandbox mode "${activeMode}" denies ${params.operation}s.`);
+      if (params.operation === "write") {
+        if (isHardWriteDenied(path, ctx.cwd)) {
+          return textResult(`Denied: "${path}" is covered by a hard write deny.`);
+        }
+        if (matchesPattern(path, effectiveWritePaths(), ctx.cwd)) {
+          return textResult(`Write access to "${path}" is already allowed.`);
+        }
+        if (activeLegacyCategoricalDenies().write) {
+          return textResult(`Denied: legacy sandbox mode "${activeMode}" denies writes.`);
+        }
+        if (activeOtherwisePolicy().write === "deny") {
+          return textResult(`Denied: the active policy denies unlisted writes.`);
+        }
       }
       const choice = await promptAccessRequest(ctx, params.operation, path, params.reason);
       if (choice === "abort")
@@ -785,7 +835,11 @@ export default function (pi: ExtensionAPI) {
     if (pathForRecursiveTool !== undefined) {
       const root = canonicalizePath(pathForRecursiveTool, ctx.cwd);
       const decision = readDecision(root, ctx.cwd);
-      if (decision === "hard-deny" || decision === "mode-deny") {
+      if (
+        decision === "hard-deny" ||
+        decision === "legacy-mode-deny" ||
+        decision === "unlisted-deny"
+      ) {
         return {
           block: true,
           reason: `Sandbox blocks recursive read root "${root}" (${decision}).`,
@@ -813,7 +867,11 @@ export default function (pi: ExtensionAPI) {
     if (isToolCallEventType("read", event)) {
       const path = canonicalizePath(event.input.path, ctx.cwd);
       const decision = readDecision(path, ctx.cwd);
-      if (decision === "hard-deny" || decision === "mode-deny") {
+      if (
+        decision === "hard-deny" ||
+        decision === "legacy-mode-deny" ||
+        decision === "unlisted-deny"
+      ) {
         return { block: true, reason: `Sandbox blocks read access to "${path}" (${decision}).` };
       }
       if (decision === "prompt") {
@@ -831,10 +889,13 @@ export default function (pi: ExtensionAPI) {
       if (isHardWriteDenied(path, ctx.cwd)) {
         return { block: true, reason: `Sandbox hard-denies writes to "${path}".` };
       }
-      if (activeModePolicy().write === "deny") {
-        return { block: true, reason: `Sandbox mode "${activeMode}" denies writes.` };
+      if (activeLegacyCategoricalDenies().write) {
+        return { block: true, reason: `Legacy sandbox mode "${activeMode}" denies writes.` };
       }
       if (!matchesPattern(path, effectiveWritePaths(), ctx.cwd)) {
+        if (activeOtherwisePolicy().write === "deny") {
+          return { block: true, reason: "Sandbox policy denies unlisted writes." };
+        }
         const choice = await promptWriteBlock(ctx, path);
         if (choice === "abort")
           return { block: true, reason: `Sandbox denied write access to "${path}".` };
@@ -1056,12 +1117,12 @@ export default function (pi: ExtensionAPI) {
         "error",
       );
     }
-    const modePolicy = activeModePolicy();
-    if (kind === "read" && modePolicy.read === "deny") {
-      return void ctx.ui.notify(`Sandbox mode "${activeMode}" denies reads`, "error");
+    const categorical = activeLegacyCategoricalDenies();
+    if (kind === "read" && categorical.read) {
+      return void ctx.ui.notify(`Legacy sandbox mode "${activeMode}" denies reads`, "error");
     }
-    if (kind === "write" && modePolicy.write === "deny") {
-      return void ctx.ui.notify(`Sandbox mode "${activeMode}" denies writes`, "error");
+    if (kind === "write" && categorical.write) {
+      return void ctx.ui.notify(`Legacy sandbox mode "${activeMode}" denies writes`, "error");
     }
 
     const classification = classifyCommandGrant(kind, raw, ctx.cwd);
