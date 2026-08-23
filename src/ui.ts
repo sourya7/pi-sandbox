@@ -280,18 +280,16 @@ export function formatSandboxStatus(
   if (state === "initializing") return "⏳ Sandbox initializing — tools blocked";
   if (state === "disabled-by-user") return "⚠️ Sandbox explicitly disabled";
   const networkLabel = categorical.network
-    ? "network denied by legacy mode"
+    ? "N:denied"
     : allowsAllDomains(config.network?.allowedDomains)
-      ? "all domains"
-      : `${config.network?.allowedDomains?.length ?? 0} domains · unlisted ${otherwisePolicy.network}`;
+      ? "N:all"
+      : `N:${config.network?.allowedDomains?.length ?? 0}/${otherwisePolicy.network}`;
   const writeLabel = categorical.write
-    ? "writes denied by legacy mode"
-    : `${config.filesystem.allowWrite.length} write paths · unlisted ${otherwisePolicy.write}`;
+    ? "W:denied"
+    : `W:${config.filesystem.allowWrite.length}/${otherwisePolicy.write}`;
   const scope = config.filesystem.readScope ?? "home";
-  const overrideLabel = exactOverrideCount
-    ? ` · ⚠️ ${exactOverrideCount} exact deny override${exactOverrideCount === 1 ? "" : "s"}`
-    : "";
-  return `🔒 Sandbox: ${mode}${overrideLabel} · read ${scope} · ${writeLabel} · ${networkLabel}`;
+  const overrideLabel = exactOverrideCount ? ` ⚠${exactOverrideCount}` : "";
+  return `🔒 ${mode}${overrideLabel} · R:${scope} · ${writeLabel} · ${networkLabel}`;
 }
 
 function formatPathRequest(entry: ClassifiedPathRequest): string[] {

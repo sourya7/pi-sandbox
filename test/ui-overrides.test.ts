@@ -15,11 +15,8 @@ const override: ExactSessionOverride = {
 };
 
 test("status warns when exact deny overrides are active", () => {
-  assert.match(
-    formatSandboxStatus(DEFAULT_CONFIG, "default", "active", 1),
-    /1 exact deny override/,
-  );
-  assert.doesNotMatch(formatSandboxStatus(DEFAULT_CONFIG), /exact deny override/);
+  assert.match(formatSandboxStatus(DEFAULT_CONFIG, "default", "active", 1), /⚠1/);
+  assert.doesNotMatch(formatSandboxStatus(DEFAULT_CONFIG), /⚠/);
 });
 
 test("configuration distinguishes configured and effective denies", () => {

@@ -15,15 +15,17 @@ import {
 } from "../src/ui.ts";
 
 test("sandbox status includes arbitrary active mode and resolved behavior", () => {
-  assert.match(formatSandboxStatus(DEFAULT_CONFIG, "build"), /Sandbox: build/);
-  assert.match(formatSandboxStatus(DEFAULT_CONFIG, "build"), /write paths/);
-  assert.match(
+  assert.equal(
+    formatSandboxStatus(DEFAULT_CONFIG, "build"),
+    "🔒 build · R:home · W:2/prompt · N:10/prompt",
+  );
+  assert.equal(
     formatSandboxStatus(DEFAULT_CONFIG, "audit", "active", 0, {
       read: "prompt",
       write: "deny",
       network: "deny",
     }),
-    /Sandbox: audit.*write paths · unlisted deny.*domains · unlisted deny/,
+    "🔒 audit · R:home · W:2/deny · N:10/deny",
   );
 });
 
