@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants, existsSync, accessSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -26,11 +27,13 @@ export interface SessionAllowances {
 
 export function createNetworkAskCallback(
   allowedDomains: string[],
-  onBlockedDomain?: (host: string) => Promise<boolean>,
+  onBlockedDomain?: (destination: string) => Promise<boolean>,
 ): SandboxAskCallback {
-  return async ({ host }) => {
-    if (domainIsAllowed(host, allowedDomains)) return true;
-    return onBlockedDomain ? onBlockedDomain(host) : false;
+  return async ({ host, port }) => {
+    if (domainIsAllowed(host, allowedDomains, port)) return true;
+    const destination =
+      port === undefined ? host : `${host.includes(":") ? `[${host}]` : host}:${port}`;
+    return onBlockedDomain ? onBlockedDomain(destination) : false;
   };
 }
 
@@ -69,10 +72,11 @@ export function filterDenyWriteForRuntime(denyWrite: string[], cwd: string): str
 }
 
 export function getRuntimeBootstrapReadPaths(cwd: string, strict: boolean): string[] {
-  const candidates = new Set<string>([process.execPath]);
-  const shell = process.env.SHELL;
-  if (shell) candidates.add(shell);
+  const candidates = new Set<string>();
   if (strict) {
+    // Add broad roots before nested executables. Upstream emits allowRead binds
+    // in input order; a nested bind cannot be created after its parent is masked
+    // unless the broad parent has already been restored.
     const platformPaths =
       process.platform === "darwin"
         ? [
@@ -92,11 +96,32 @@ export function getRuntimeBootstrapReadPaths(cwd: string, strict: boolean): stri
         : ["/bin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys", "/run", "/nix"];
     for (const path of platformPaths) if (existsSync(path)) candidates.add(path);
   }
-  return [...candidates].map((path) => canonicalizePath(path, cwd));
+  candidates.add(process.execPath);
+  const shell = process.env.SHELL;
+  if (shell) candidates.add(shell);
+  const resolved = [...candidates].map((path) => canonicalizePath(path, cwd));
+  return resolved.filter(
+    (path, index) =>
+      !resolved.some(
+        (ancestor, ancestorIndex) =>
+          ancestorIndex < index &&
+          ancestor !== path &&
+          (ancestor === "/" || path.startsWith(`${ancestor}/`)),
+      ),
+  );
 }
 
 function uniquePaths(paths: string[], cwd: string): string[] {
   return [...new Set(resolvePolicyPatterns(paths, cwd).map((path) => path.replace(/\/\*\*$/, "")))];
+}
+
+function removeRedundantDescendants(paths: string[]): string[] {
+  return paths.filter(
+    (path) =>
+      !paths.some(
+        (ancestor) => ancestor !== path && (ancestor === "/" || path.startsWith(`${ancestor}/`)),
+      ),
+  );
 }
 
 /** Preserve the configured spelling as well as its canonical target. The
@@ -136,11 +161,11 @@ export function buildRuntimeConfig(
   const configuredRead = [
     ...new Set([...uniquePaths(readInputs, cwd), ...uniqueLexicalPaths(readInputs, cwd)]),
   ];
-  const bootstrap = [
+  const bootstrap = removeRedundantDescendants([
     ...getRuntimeBootstrapReadPaths(cwd, readScope === "strict"),
     ...uniquePaths(additionalBootstrapReadPaths, cwd),
     ...uniqueLexicalPaths(additionalBootstrapReadPaths, cwd),
-  ];
+  ]);
   const scopeDeny = readScope === "strict" ? ["/"] : readScope === "home" ? [homedir()] : [];
   const credentialHardRead = uniquePaths(
     (config.credentials?.files ?? [])
@@ -162,9 +187,11 @@ export function buildRuntimeConfig(
     filesystem: {
       disabled: filesystem.disabled,
       allowGitConfig: filesystem.allowGitConfig,
-      denyRead: scopeDeny,
+      // Upstream keeps a deny that is more specific than an enclosing allow.
+      // Put hard denies alongside the broad scope deny so /project/secret stays
+      // denied while /project is re-opened by allowRead.
+      denyRead: [...new Set([...scopeDeny, ...hardRead])],
       allowRead: [...new Set([...configuredRead, ...bootstrap])],
-      denyReadAlways: hardRead,
       allowWrite: writePaths,
       denyWrite: filterDenyWriteForRuntime(denyWrite, cwd),
     },
@@ -295,80 +322,146 @@ export function extractBlockedWritePath(output: string): string | null {
   return violation?.type === "write" ? violation.path : null;
 }
 
+const EXIT_STDIO_GRACE_MS = 100;
+
+/** Wait for the direct child without hanging forever when a detached
+ * descendant inherits its pipes. Output that remains active gets a fresh
+ * grace period after every chunk. */
+function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let exited = false;
+    let exitCode: number | null = null;
+    let timer: NodeJS.Timeout | undefined;
+    let stdoutEnded = child.stdout === null;
+    let stderrEnded = child.stderr === null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onClose);
+      child.stdout?.removeListener("end", onStdoutEnd);
+      child.stderr?.removeListener("end", onStderrEnd);
+      child.stdout?.removeListener("data", onData);
+      child.stderr?.removeListener("data", onData);
+    };
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(code);
+    };
+    const maybeFinish = () => {
+      if (exited && stdoutEnded && stderrEnded) finish(exitCode);
+    };
+    const armTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS);
+    };
+    const onData = () => {
+      if (exited) armTimer();
+    };
+    const onStdoutEnd = () => {
+      stdoutEnded = true;
+      maybeFinish();
+    };
+    const onStderrEnd = () => {
+      stderrEnded = true;
+      maybeFinish();
+    };
+    const onError = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null) => {
+      exited = true;
+      exitCode = code;
+      maybeFinish();
+      if (!settled) armTimer();
+    };
+    const onClose = (code: number | null) => finish(code);
+
+    child.stdout?.once("end", onStdoutEnd);
+    child.stderr?.once("end", onStderrEnd);
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    child.once("error", onError);
+    child.once("exit", onExit);
+    child.once("close", onClose);
+  });
+}
+
 export function createSandboxedBashOps(shellPath?: string): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
       if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
 
       const { shell, args } = getShellConfig(shellPath);
-      const wrappedCommand = await SandboxManager.wrapWithSandbox(command, shell);
-      const violationCursor = SandboxManager.getSandboxViolationStore().getCursor();
+      const commandId = randomUUID();
+      const wrappedCommand = await SandboxManager.wrapWithSandbox(
+        command,
+        shell,
+        undefined,
+        signal,
+        { commandId, commandText: command },
+      );
 
-      return new Promise((resolve, reject) => {
-        const child = spawn(shell, [...args, wrappedCommand], {
-          cwd,
-          env,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        let timedOut = false;
-        let timeoutHandle: NodeJS.Timeout | undefined;
-
-        const killProcessGroup = () => {
-          if (!child.pid) return;
-          try {
-            process.kill(-child.pid, "SIGKILL");
-          } catch {
-            child.kill("SIGKILL");
-          }
-        };
-
-        if (timeout !== undefined && timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            timedOut = true;
-            killProcessGroup();
-          }, timeout * 1000);
-        }
-
-        let stderr = "";
-
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", (data: Buffer) => {
-          stderr += data.toString("utf8");
-          onData(data);
-        });
-        child.on("error", (error) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          reject(error);
-        });
-
-        signal?.addEventListener("abort", killProcessGroup, { once: true });
-        child.on("close", (code) => {
-          void (async () => {
-            if (timeoutHandle) clearTimeout(timeoutHandle);
-            signal?.removeEventListener("abort", killProcessGroup);
-
-            try {
-              await SandboxManager.waitForSandboxViolationDrain();
-              const annotatedStderr = SandboxManager.annotateStderrWithSandboxFailures(
-                command,
-                stderr,
-                violationCursor,
-              );
-              if (annotatedStderr !== stderr) {
-                onData(Buffer.from(annotatedStderr.slice(stderr.length), "utf8"));
-              }
-            } finally {
-              SandboxManager.cleanupAfterCommand();
-            }
-
-            if (signal?.aborted) reject(new Error("aborted"));
-            else if (timedOut) reject(new Error(`timeout:${timeout}`));
-            else resolve({ exitCode: code });
-          })().catch(reject);
-        });
+      const child = spawn(shell, [...args, wrappedCommand], {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
       });
+
+      let timedOut = false;
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      let stderr = "";
+      const killProcessGroup = () => {
+        if (!child.pid) return;
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      };
+
+      if (timeout !== undefined && timeout > 0) {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          killProcessGroup();
+        }, timeout * 1000);
+      }
+      child.stdout?.on("data", onData);
+      child.stderr?.on("data", (data: Buffer) => {
+        stderr += data.toString("utf8");
+        onData(data);
+      });
+      signal?.addEventListener("abort", killProcessGroup, { once: true });
+
+      try {
+        const exitCode = await waitForChildProcess(child);
+        // Linux observation is socket-driven and needs one event-loop turn;
+        // macOS log-stream delivery needs a short bounded grace period.
+        await new Promise<void>((done) =>
+          process.platform === "darwin" ? setTimeout(done, 100) : setImmediate(done),
+        );
+        const annotatedStderr = SandboxManager.annotateStderrWithSandboxFailures(commandId, stderr);
+        if (annotatedStderr !== stderr) {
+          onData(Buffer.from(annotatedStderr.slice(stderr.length), "utf8"));
+        }
+        if (signal?.aborted) throw new Error("aborted");
+        if (timedOut) throw new Error(`timeout:${timeout}`);
+        return { exitCode };
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        signal?.removeEventListener("abort", killProcessGroup);
+        SandboxManager.cleanupAfterCommand();
+      }
     },
   };
 }

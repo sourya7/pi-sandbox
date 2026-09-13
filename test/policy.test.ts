@@ -19,7 +19,13 @@ test("matches exact, wildcard, and all-domain policies", () => {
   assert.equal(domainIsAllowed("github.com", ["github.com"]), true);
   assert.equal(domainIsAllowed("api.github.com", ["*.github.com"]), true);
   assert.equal(domainIsAllowed("notgithub.com", ["*.github.com"]), false);
+  assert.equal(domainIsAllowed("github.com", ["github.com:443"], 443), true);
+  assert.equal(domainIsAllowed("github.com", ["github.com:443"], 80), false);
+  assert.equal(domainIsAllowed("api.github.com", ["*.github.com:8443"], 8443), true);
+  assert.equal(domainIsAllowed("[2001:db8::1]:443", ["[2001:db8::1]:443"]), true);
+  assert.equal(domainIsAllowed("example.com:22", ["*:22"]), true);
   assert.equal(allowsAllDomains(["*"]), true);
+  assert.equal(allowsAllDomains(["*:443"]), false);
 });
 
 test("empty allowWrite prompts securely", () => {

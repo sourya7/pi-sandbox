@@ -1,14 +1,20 @@
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import {
+  SandboxManager,
+  type SandboxRuntimeConfig,
+  type WrapWithSandboxOptions,
+} from "@anthropic-ai/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import { applyGlobalModeProfile, DEFAULT_CONFIG, validateConfig } from "../src/config.ts";
 import {
   buildRuntimeConfig,
+  createNetworkAskCallback,
+  createSandboxedBashOps,
   extractBlockedWritePath,
   extractSandboxViolation,
   filterDenyWriteForRuntime,
@@ -31,9 +37,35 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.equal(runtime.filesystem?.allowWrite?.includes("/write"), true);
   assert.equal(runtime.filesystem?.allowRead?.includes("/write"), true);
   assert.deepEqual(runtime.filesystem?.denyRead, [process.env.HOME]);
-  assert.deepEqual(runtime.filesystem?.denyReadAlways, []);
   assert.equal(runtime.enableWeakerNetworkIsolation, false);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
+});
+
+test("buildRuntimeConfig preserves resolved-address guards and deny reasons", () => {
+  const runtime = buildRuntimeConfig({
+    ...DEFAULT_CONFIG,
+    network: {
+      ...DEFAULT_CONFIG.network,
+      deniedDomains: ["*:22"],
+      deniedDomainReasons: { "*:22": "Use HTTPS" },
+      deniedResolvedAddresses: ["10.0.0.0/8", "fc00::/7"],
+    },
+  });
+  assert.deepEqual(runtime.network.deniedResolvedAddresses, ["10.0.0.0/8", "fc00::/7"]);
+  assert.deepEqual(runtime.network.deniedDomainReasons, { "*:22": "Use HTTPS" });
+});
+
+test("network callback preserves destination ports and brackets IPv6", async () => {
+  const prompts: string[] = [];
+  const callback = createNetworkAskCallback(["example.com:443"], async (destination) => {
+    prompts.push(destination);
+    return true;
+  });
+
+  assert.equal(await callback({ host: "example.com", port: 443 }), true);
+  assert.deepEqual(prompts, []);
+  assert.equal(await callback({ host: "2001:db8::1", port: 8443 }), true);
+  assert.deepEqual(prompts, ["[2001:db8::1]:8443"]);
 });
 
 test("v3 replacement profile reaches runtime without inherited project grants", () => {
@@ -65,7 +97,7 @@ test("v3 replacement profile reaches runtime without inherited project grants", 
     assert.equal(runtime.filesystem.allowRead?.includes(cwd), false);
     assert.equal(runtime.filesystem.allowWrite?.includes("/tmp"), true);
     assert.equal(runtime.filesystem.allowRead?.includes("/tmp"), true);
-    assert.equal(runtime.filesystem.denyReadAlways?.includes(secret), true);
+    assert.equal(runtime.filesystem.denyRead?.includes(secret), true);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -172,7 +204,7 @@ test("extractSandboxViolation classifies read, write, and network annotations", 
   );
 });
 
-test("exact override derivation removes only the selected runtime final deny", () => {
+test("exact override derivation removes only the selected specific runtime deny", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-override-"));
   const target = join(cwd, ".env");
   const sibling = join(cwd, ".env.local");
@@ -201,12 +233,12 @@ test("exact override derivation removes only the selected runtime final deny", (
     { domains: [], readPaths: paths.readPaths, writePaths: paths.writePaths },
     cwd,
   );
-  assert.equal(runtime.filesystem.denyReadAlways?.includes(target), false);
-  assert.equal(runtime.filesystem.denyReadAlways?.includes(sibling), true);
+  assert.equal(runtime.filesystem.denyRead?.includes(target), false);
+  assert.equal(runtime.filesystem.denyRead?.includes(sibling), true);
   assert.equal(runtime.filesystem.allowRead?.includes(target), true);
 });
 
-test("v2 runtime config maps user denyRead to authoritative final denies", () => {
+test("v2 runtime config keeps user denyRead more specific than scope allows", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v2-runtime-"));
   const secret = join(cwd, "secret");
   const policyFile = join(cwd, ".pi", "sandbox.json");
@@ -226,13 +258,13 @@ test("v2 runtime config maps user denyRead to authoritative final denies", () =>
     cwd,
     [policyFile],
   );
-  assert.deepEqual(runtime.filesystem?.denyRead, ["/"]);
-  assert.equal(runtime.filesystem?.denyReadAlways?.includes(secret), true);
+  assert.equal(runtime.filesystem?.denyRead?.includes("/"), true);
+  assert.equal(runtime.filesystem?.denyRead?.includes(secret), true);
   assert.equal(runtime.filesystem?.denyWrite.includes(secret), true);
   assert.equal(runtime.filesystem?.denyWrite.includes(policyFile), true);
 });
 
-test("credential file deny rules use the final read-deny layer", () => {
+test("credential file deny rules use specific runtime read denies", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-credential-runtime-"));
   const credential = join(cwd, "token");
   const runtime = buildRuntimeConfig(
@@ -243,40 +275,118 @@ test("credential file deny rules use the final read-deny layer", () => {
     undefined,
     cwd,
   );
-  assert.equal(runtime.filesystem?.denyReadAlways?.includes(credential), true);
+  assert.equal(runtime.filesystem?.denyRead?.includes(credential), true);
   assert.equal(runtime.filesystem?.denyWrite.includes(credential), true);
 });
 
-test("cursor-aware annotation excludes historical violations", () => {
+test("unique command attribution excludes historical violations", () => {
   SandboxManager.updateConfig(buildRuntimeConfig(DEFAULT_CONFIG));
   const store = SandboxManager.getSandboxViolationStore();
   const command = "printf replay-test";
-  const encodedCommand = Buffer.from(command.slice(0, 100)).toString("base64");
+  const historicalId = "historical-command-id";
+  const currentId = "current-command-id";
 
   store.clear();
   try {
     store.addViolation({
       line: "deny openat /historical",
       command,
-      encodedCommand,
+      encodedCommand: Buffer.from(historicalId).toString("base64"),
       timestamp: new Date(),
     });
-    const cursor = store.getCursor();
-
-    assert.match(SandboxManager.annotateStderrWithSandboxFailures(command, ""), /historical/);
-    assert.equal(SandboxManager.annotateStderrWithSandboxFailures(command, "", cursor), "");
-
     store.addViolation({
       line: "deny openat /current",
       command,
-      encodedCommand,
+      encodedCommand: Buffer.from(currentId).toString("base64"),
       timestamp: new Date(),
     });
-    const annotated = SandboxManager.annotateStderrWithSandboxFailures(command, "", cursor);
+
+    const annotated = SandboxManager.annotateStderrWithSandboxFailures(currentId, "");
     assert.doesNotMatch(annotated, /historical/);
     assert.match(annotated, /current/);
   } finally {
     store.clear();
+  }
+});
+
+test("sandboxed bash does not hang on a descendant holding stdio", async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-stdio-"));
+  const pidFile = join(cwd, "pid");
+  let wrappedOptions: { commandId?: string; commandText?: string } | undefined;
+  t.mock.method(
+    SandboxManager,
+    "wrapWithSandbox",
+    async (
+      command: string,
+      _shell?: string,
+      _config?: Partial<SandboxRuntimeConfig>,
+      _signal?: AbortSignal,
+      options?: WrapWithSandboxOptions,
+    ) => {
+      wrappedOptions = options;
+      return command;
+    },
+  );
+  t.mock.method(
+    SandboxManager,
+    "annotateStderrWithSandboxFailures",
+    (_id: string, stderr: string) => stderr,
+  );
+  t.mock.method(SandboxManager, "cleanupAfterCommand", () => undefined);
+
+  try {
+    const ops = createSandboxedBashOps(process.env.SHELL);
+    const started = Date.now();
+    const result = await ops.exec(`sleep 5 & echo $! > ${JSON.stringify(pidFile)}`, cwd, {
+      onData: () => undefined,
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(typeof wrappedOptions?.commandId, "string");
+    assert.match(wrappedOptions?.commandId ?? "", /^[0-9a-f-]{36}$/);
+    assert.match(wrappedOptions?.commandText ?? "", /sleep 5/);
+    assert.ok(
+      Date.now() - started < 1500,
+      "direct child exit should not wait for descendant stdio",
+    );
+  } finally {
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (Number.isSafeInteger(pid)) process.kill(pid, "SIGKILL");
+    } catch {
+      // Child may already be gone.
+    }
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("sandboxed bash timeout and cancellation kill the process group", async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-cancel-"));
+  t.mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => command);
+  t.mock.method(
+    SandboxManager,
+    "annotateStderrWithSandboxFailures",
+    (_id: string, stderr: string) => stderr,
+  );
+  t.mock.method(SandboxManager, "cleanupAfterCommand", () => undefined);
+  const ops = createSandboxedBashOps(process.env.SHELL);
+
+  try {
+    await assert.rejects(
+      () => ops.exec("sleep 5", cwd, { onData: () => undefined, timeout: 0.05 }),
+      /timeout:0\.05/,
+    );
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+    await assert.rejects(
+      () =>
+        ops.exec("sleep 5", cwd, {
+          onData: () => undefined,
+          signal: controller.signal,
+        }),
+      /aborted/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 

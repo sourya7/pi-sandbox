@@ -551,6 +551,23 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function updateSandboxPolicy(cwd: string): void {
+    if (state !== "active") throw new Error(`sandbox is ${state}`);
+    const loaded = requirePolicy();
+    // Runtime allowlists are read per network request and filesystem profiles
+    // are built per wrapped command. Updating a grant therefore does not need
+    // to tear down active proxy connections or alter an already-running child.
+    SandboxManager.updateConfig(
+      buildRuntimeConfig(
+        runtimeConfigForActiveMode(),
+        runtimeAllowancesForActiveMode(),
+        cwd,
+        loaded.protectedWritePaths,
+        bootstrapShellPaths,
+      ),
+    );
+  }
+
   function grantTarget(choice: Exclude<PermissionChoice, "abort">): string | undefined {
     if (choice === "session") return undefined;
     const paths = requirePolicy().paths;
@@ -578,7 +595,7 @@ export default function (pi: ExtensionAPI) {
         const added = !list.includes(value);
         if (added) list.push(value);
         try {
-          if (refresh) await refreshSandbox(cwd);
+          if (refresh) updateSandboxPolicy(cwd);
         } catch (error) {
           if (added) list.splice(list.indexOf(value), 1);
           throw error;
@@ -614,15 +631,7 @@ export default function (pi: ExtensionAPI) {
       const choice = await promptDomainBlock(ctx, host);
       if (choice === "abort") return false;
       await applyChoice(choice, "domain", host, ctx.cwd ?? cwd, false);
-      SandboxManager.updateConfig(
-        buildRuntimeConfig(
-          runtimeConfigForActiveMode(),
-          runtimeAllowancesForActiveMode(),
-          ctx.cwd ?? cwd,
-          loaded.protectedWritePaths,
-          bootstrapShellPaths,
-        ),
-      );
+      updateSandboxPolicy(ctx.cwd ?? cwd);
       return true;
     })().finally(() => pendingDomainPrompts.delete(host));
     pendingDomainPrompts.set(host, prompt);

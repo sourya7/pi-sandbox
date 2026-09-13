@@ -297,7 +297,7 @@ test("operator-confirmed exact overrides refresh, diagnose, and clear without ag
       notifications,
     });
     await emit(harness, "session_start", { reason: "startup" }, ctx);
-    assert.equal(runtimeConfigs[0]?.filesystem.denyReadAlways?.includes(target), true);
+    assert.equal(runtimeConfigs[0]?.filesystem.denyRead?.includes(target), true);
 
     const requestTool = harness.tools.get("request_sandbox_access");
     assert.ok(requestTool);
@@ -316,7 +316,7 @@ test("operator-confirmed exact overrides refresh, diagnose, and clear without ag
     assert.equal(confirmationRequests[0].timeout, 60_000);
     assert.match(confirmationRequests[0].message, /Path: .*\.env/);
     assert.match(confirmationRequests[0].message, /denyRead \.env/);
-    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(target), false);
+    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyRead?.includes(target), false);
     assert.equal(runtimeConfigs.at(-1)?.filesystem.allowRead?.includes(target), true);
 
     await harness.commands.get("sandbox")?.handler("", ctx);
@@ -324,7 +324,7 @@ test("operator-confirmed exact overrides refresh, diagnose, and clear without ag
     assert.match(notifications.at(-1) ?? "", /removed: denyRead \.env/);
 
     await harness.commands.get("sandbox-clear-overrides")?.handler("", ctx);
-    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(target), true);
+    assert.equal(runtimeConfigs.at(-1)?.filesystem.denyRead?.includes(target), true);
 
     const configCount = runtimeConfigs.length;
     const resetsBeforeCancellation = resetCount;
@@ -388,7 +388,7 @@ test("RPC can confirm an exact override while JSON mode fails closed", async (t)
     await harness.commands.get("sandbox-allow-read")?.handler(".env", rpcCtx);
     assert.equal(confirmationRequests.length, 1);
     assert.equal(
-      runtimeConfigs.at(-1)?.filesystem.denyReadAlways?.includes(join(projectRoot, ".env")),
+      runtimeConfigs.at(-1)?.filesystem.denyRead?.includes(join(projectRoot, ".env")),
       false,
     );
 

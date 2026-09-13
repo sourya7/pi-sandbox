@@ -7,6 +7,13 @@
     "pi-extension"
   ],
   "type": "module",
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE",
+    "sandbox.json"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
@@ -35,12 +42,10 @@
     "ci:fmt": "oxfmt --check index.ts src test",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
-    "ci:test": "npm test",
-    "runtime:build": "npm --prefix sandbox-runtime run build",
-    "runtime:setup": "npm --prefix sandbox-runtime install && npm run runtime:build && npm install --ignore-scripts"
+    "ci:test": "npm test"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "file:./sandbox-runtime",
+    "@anthropic-ai/sandbox-runtime": "0.0.76",
     "typebox": "1.1.38"
   },
   "peerDependencies": {

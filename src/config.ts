@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
-import { type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import { NetworkConfigSchema, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -153,6 +153,14 @@ export function deepMerge(base: SandboxConfig, overrides: SandboxPolicyDocument)
       allowedDomains:
         mergeList(base.network?.allowedDomains, overrides.network.allowedDomains) ?? [],
       deniedDomains: mergeList(base.network?.deniedDomains, overrides.network.deniedDomains) ?? [],
+      deniedResolvedAddresses: mergeList(
+        base.network?.deniedResolvedAddresses,
+        overrides.network.deniedResolvedAddresses,
+      ),
+      deniedDomainReasons: {
+        ...base.network?.deniedDomainReasons,
+        ...overrides.network.deniedDomainReasons,
+      },
     };
   }
   if (overrides.filesystem) {
@@ -187,6 +195,14 @@ export function applyGlobalModeProfile(
           ? [...(base.network?.allowedDomains ?? [])]
           : [...new Set(profile.network.allowedDomains)],
       deniedDomains: mergeList(base.network?.deniedDomains, profile.network.deniedDomains) ?? [],
+      deniedResolvedAddresses: mergeList(
+        base.network?.deniedResolvedAddresses,
+        profile.network.deniedResolvedAddresses,
+      ),
+      deniedDomainReasons: {
+        ...base.network?.deniedDomainReasons,
+        ...profile.network.deniedDomainReasons,
+      },
     };
   }
   if (profile.filesystem) {
@@ -224,14 +240,11 @@ function hasUnsupportedFilesystemGlob(pattern: string): boolean {
 }
 
 function assertDomainPattern(pattern: string, field: string): void {
-  const host = pattern.startsWith("*.") ? pattern.slice(2) : pattern;
-  if (
-    pattern !== "*" &&
-    (!host ||
-      host.includes("*") ||
-      host.includes("/") ||
-      !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(host))
-  ) {
+  const denied = field.endsWith(".deny") || field.endsWith(".deniedDomains");
+  const schema = denied
+    ? NetworkConfigSchema.shape.deniedDomains
+    : NetworkConfigSchema.shape.allowedDomains;
+  if (!schema.safeParse([pattern]).success) {
     throw new Error(`${field} contains unsupported domain pattern "${pattern}"`);
   }
 }
@@ -273,6 +286,19 @@ function validateV2Config(value: Record<string, unknown>, source: string): Sandb
     if (!isRecord(network)) throw new Error(`${source}: network must be an object`);
     validateDomainList(network.allowedDomains, `${source}: network.allowedDomains`);
     validateDomainList(network.deniedDomains, `${source}: network.deniedDomains`);
+    if (
+      network.deniedResolvedAddresses !== undefined &&
+      !NetworkConfigSchema.shape.deniedResolvedAddresses.safeParse(network.deniedResolvedAddresses)
+        .success
+    ) {
+      throw new Error(`${source}: network.deniedResolvedAddresses must contain IP/CIDR ranges`);
+    }
+    if (
+      network.deniedDomainReasons !== undefined &&
+      !NetworkConfigSchema.shape.deniedDomainReasons.safeParse(network.deniedDomainReasons).success
+    ) {
+      throw new Error(`${source}: network.deniedDomainReasons must map domains to reasons`);
+    }
   }
   const filesystem = value.filesystem;
   if (filesystem !== undefined) {
@@ -342,6 +368,19 @@ function validateV3Config(value: Record<string, unknown>, source: string): Sandb
     }
     const allow = validateDomainList(network.allow, `${source}: network.allow`);
     const deny = validateDomainList(network.deny, `${source}: network.deny`);
+    if (
+      network.deniedResolvedAddresses !== undefined &&
+      !NetworkConfigSchema.shape.deniedResolvedAddresses.safeParse(network.deniedResolvedAddresses)
+        .success
+    ) {
+      throw new Error(`${source}: network.deniedResolvedAddresses must contain IP/CIDR ranges`);
+    }
+    if (
+      network.deniedDomainReasons !== undefined &&
+      !NetworkConfigSchema.shape.deniedDomainReasons.safeParse(network.deniedDomainReasons).success
+    ) {
+      throw new Error(`${source}: network.deniedDomainReasons must map domains to reasons`);
+    }
     if (network.otherwise !== undefined) {
       otherwise.network = parseOtherwiseAction(network.otherwise, `${source}: network.otherwise`);
     }
@@ -479,7 +518,9 @@ export function splitProjectConfig(
   if (raw.otherwise?.write !== undefined) ignored.push("filesystem.write.otherwise");
   if (raw.otherwise?.network !== undefined) ignored.push("network.otherwise");
   for (const field of Object.keys(raw.network ?? {})) {
-    if (!["allowedDomains", "deniedDomains"].includes(field)) ignored.push(`network.${field}`);
+    if (!["allowedDomains", "deniedDomains", "deniedResolvedAddresses"].includes(field)) {
+      ignored.push(`network.${field}`);
+    }
   }
   for (const field of Object.keys(raw.filesystem ?? {})) {
     if (!["denyRead", "allowRead", "allowWrite", "denyWrite"].includes(field)) {
@@ -496,6 +537,7 @@ export function splitProjectConfig(
       network: {
         allowedDomains: [],
         deniedDomains: raw.network?.deniedDomains ?? [],
+        deniedResolvedAddresses: raw.network?.deniedResolvedAddresses ?? [],
       },
       filesystem: {
         denyRead: raw.filesystem?.denyRead ?? [],

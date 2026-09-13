@@ -22,6 +22,7 @@ import {
   listGlobalSandboxModes,
   loadPolicy,
   readProjectRequestApproval,
+  splitProjectConfig,
   validateConfig,
   writeProjectRequestApproval,
 } from "../src/config.ts";
@@ -212,8 +213,69 @@ test("project wildcard domain request is rejected", () => {
   );
   assert.throws(
     () => withIsolatedV2AgentDir(() => loadPolicy(cwd, "default", true)),
-    /cannot contain/,
+    /unsupported domain pattern|cannot contain/,
   );
+});
+
+test("network validation supports ports, deny-all ports, and bracketed IPv6", () => {
+  const parsed = validateConfig(
+    {
+      policyVersion: 3,
+      network: {
+        allow: ["example.com:443", "*.example.com:8443", "[2001:db8::1]:443"],
+        deny: ["*:22", "[::1]"],
+        otherwise: "deny",
+        deniedDomainReasons: { "*:22": "Use HTTPS instead" },
+        deniedResolvedAddresses: ["10.0.0.0/8", "fc00::/7"],
+      },
+    },
+    "network syntax test",
+  );
+
+  assert.deepEqual(parsed.network?.allowedDomains, [
+    "example.com:443",
+    "*.example.com:8443",
+    "[2001:db8::1]:443",
+  ]);
+  assert.deepEqual(parsed.network?.deniedDomains, ["*:22", "[::1]"]);
+  assert.deepEqual(parsed.network?.deniedResolvedAddresses, ["10.0.0.0/8", "fc00::/7"]);
+  assert.throws(
+    () =>
+      validateConfig(
+        { network: { allowedDomains: ["example.com:0"], deniedDomains: [] } },
+        "bad port",
+      ),
+    /unsupported domain pattern/,
+  );
+  assert.throws(
+    () =>
+      validateConfig(
+        { network: { allowedDomains: ["2001:db8::1"], deniedDomains: [] } },
+        "bare IPv6",
+      ),
+    /unsupported domain pattern/,
+  );
+});
+
+test("project policies may add resolved-address denies but not model-facing reasons", () => {
+  const warnings: string[] = [];
+  const { restrictions } = splitProjectConfig(
+    validateConfig({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        deniedResolvedAddresses: ["10.0.0.0/8"],
+        deniedDomainReasons: { "blocked.example": "untrusted text" },
+      },
+    }),
+    "/project/.pi/sandbox.json",
+    "project-base",
+    warnings,
+  );
+
+  assert.deepEqual(restrictions.network?.deniedResolvedAddresses, ["10.0.0.0/8"]);
+  assert.equal(restrictions.network?.deniedDomainReasons, undefined);
+  assert.match(warnings.join("\n"), /network\.deniedDomainReasons/);
 });
 
 test("request approvals are mode/root-bound and safely persisted", () => {

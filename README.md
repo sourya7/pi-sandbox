@@ -2,33 +2,26 @@
 
 OS-level sandboxing and explicit filesystem/network permissions for [Pi](https://pi.dev/).
 
-The extension covers model-facing `bash`, `read`, `write`, `edit`, `grep`, `find`, and `ls`. Bash subprocesses run through the repository's local [`sandbox-runtime`](./sandbox-runtime) fork using Seatbelt (`sandbox-exec`) on macOS and bubblewrap on Linux.
+The extension covers model-facing `bash`, `read`, `write`, `edit`, `grep`, `find`, and `ls`. Bash subprocesses use the published [Anthropic Sandbox Runtime](https://github.com/anthropics/sandbox-runtime) with Seatbelt (`sandbox-exec`) on macOS and bubblewrap on Linux.
+
+The responsibility boundary is intentional: this extension owns Pi integration, trusted policy, project approvals, prompts, hard-deny classification, and fail-closed lifecycle behavior. Sandbox Runtime owns OS profiles, mounts, proxies, DNS/address checks, native helpers, and violation observation.
 
 ## Local setup
 
-This checkout intentionally uses the git submodule as its runtime dependency; no published runtime release is required.
-
 ```bash
-git clone --recurse-submodules <this-repository>
+git clone <this-repository>
 cd pi-sandbox
 npm install
-npm run runtime:setup
 pi -e .
 ```
 
-After changing runtime source:
-
-```bash
-npm run runtime:build
-```
-
-`package.json` uses `file:./sandbox-runtime`, and the lockfile records that link. Verify it with:
+The runtime is pinned to an exact reviewed release in `package.json`. Verify that it resolves from the installed registry package with:
 
 ```bash
 node -e "console.log(import.meta.resolve('@anthropic-ai/sandbox-runtime'))"
 ```
 
-The result should point at `sandbox-runtime/dist/index.js` in this checkout.
+The result should point under `node_modules/@anthropic-ai/sandbox-runtime/dist/`. No submodule checkout or local runtime build is required.
 
 ### Platform prerequisites
 
@@ -47,58 +40,11 @@ sudo apt install ripgrep bubblewrap socat  # Debian/Ubuntu
 
 If a dependency is missing, agent tools fail closed instead of falling back to unsandboxed bash.
 
-### Build the Linux `apply-seccomp` helper
+### Packaged native helpers
 
-This step is Linux-only. `apply-seccomp` blocks sandboxed commands from creating Unix-domain sockets, preventing access to host capabilities such as Docker, SSH/GPG agents, browser sockets, and local daemons. It is required when the policy uses:
+The published runtime includes executable x64/arm64 Linux `apply-seccomp` helpers, Windows helper binaries, and its JVM proxy-agent JAR. Bun, gcc, and libseccomp development headers are not needed to install this extension.
 
-```json
-"network": {
-  "allowAllUnixSockets": false
-}
-```
-
-Published Sandbox Runtime packages normally contain prebuilt x64/arm64 helpers. This repository consumes the runtime source submodule directly, so generate the helper locally. `npm run runtime:setup` builds the TypeScript runtime but does **not** build this native helper.
-
-The build needs Bun, `gcc`, `strip`, and the libseccomp development/static libraries. Install prerequisites with the appropriate OS package manager, for example:
-
-```bash
-# Debian/Ubuntu
-sudo apt install gcc binutils libseccomp-dev
-
-# Fedora/RHEL (glibc-static is needed by the script's -static link)
-sudo dnf install gcc binutils libseccomp-devel glibc-static
-
-# Arch
-sudo pacman -S gcc binutils libseccomp
-
-# Nix: enter a temporary build environment
-nix shell nixpkgs#bun nixpkgs#gcc nixpkgs#binutils nixpkgs#libseccomp nixpkgs#glibc.static
-```
-
-Ensure `bun` is on `PATH`, then run from the repository root:
-
-```bash
-npm --prefix sandbox-runtime run build:seccomp
-```
-
-The output is architecture-specific:
-
-```text
-sandbox-runtime/vendor/seccomp/x64/apply-seccomp    # Node arch x64
-sandbox-runtime/vendor/seccomp/arm64/apply-seccomp  # Node arch arm64
-```
-
-Verify the current architecture's helper:
-
-```bash
-arch_dir=$(node -p 'process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : "unsupported"')
-test "$arch_dir" != unsupported
-test -x "sandbox-runtime/vendor/seccomp/$arch_dir/apply-seccomp"
-```
-
-After building it, set `network.allowAllUnixSockets` to `false` in the active global and mode policies, then restart Pi. If the helper is missing while socket blocking is enabled, bash may fail with an error naming `vendor/seccomp/<arch>/apply-seccomp`. Keeping `allowAllUnixSockets: true` avoids the native helper but leaves host Unix sockets as a significant escape surface.
-
-macOS does not use `apply-seccomp`; Seatbelt enforces Unix-socket restrictions there.
+On Linux, `apply-seccomp` blocks sandboxed commands from creating Unix-domain sockets when `network.allowAllUnixSockets` is false. This protects host capabilities such as Docker, SSH/GPG agents, browser sockets, and local daemons. Unsupported architectures can set `allowAllUnixSockets: true`, but that is a significant weakening. macOS uses Seatbelt instead of `apply-seccomp`.
 
 ## Policy version 3 and data-driven modes
 
@@ -235,6 +181,24 @@ For each trusted global file:
 
 Project declarations and user-owned reactive grants may remain version 2. Request approval records remain version 2 internal records.
 
+### Network ports, IPv6, and resolved-address guards
+
+Network allow/deny entries accept optional ports, for example `github.com:443`, `*.example.com:8443`, and the deny-only pattern `*:22`. IPv6 literals must use brackets in domain lists: `[::1]` or `[2001:db8::1]:443`.
+
+Trusted global policies may set `network.deniedDomainReasons` to explain a denial and `network.deniedResolvedAddresses` to prevent allowed hostnames from resolving into sensitive ranges. The runtime always protects loopback, link-local, metadata endpoints, and host-interface addresses. To additionally block private/LAN ranges, configure:
+
+```json
+"deniedResolvedAddresses": [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "100.64.0.0/10",
+  "fc00::/7"
+]
+```
+
+Private ranges are not denied by default because explicitly allowed intranet hosts are a supported workflow. Project policies may add resolved-address denies but cannot remove trusted global denies or provide model-facing denial reasons.
+
 ## Configuration trust, project requests, and grants
 
 Allow fields have source-dependent authority:
@@ -342,6 +306,7 @@ These are readable compatibility exceptions, not hidden guarantees. `home` scope
 
 ## Security limitations
 
+- Anthropic Sandbox Runtime currently exposes a process-global `SandboxManager`. Concurrent Pi extension instances, including parent/subagent sessions in one process, are not independently isolated and can replace or reset shared runtime state. Robust per-session isolation requires an upstream manager-instance API or a separate runtime broker process.
 - Trusted Pi extensions and arbitrary custom tools run in the host Pi process and are not automatically confined.
 - This is not a VM/container boundary; use one for hostile or unattended work.
 - Directory names and limited metadata may still be observable through an allowed parent.
@@ -352,23 +317,23 @@ These are readable compatibility exceptions, not hidden guarantees. `home` scope
 ## Development and verification
 
 ```bash
-npm run runtime:build
-npm --prefix sandbox-runtime run typecheck
 npm run ci:fmt
 npm run ci:lint
 npm run check
 npm test
 ```
 
-The root tests include:
+The root tests include v2/v3 policy, config trust, project approvals, fail-closed lifecycle, public runtime contract, and Linux end-to-end hard-deny coverage. macOS end-to-end checks require a macOS host.
 
-- v2 compatibility and v3 data-driven mode/config/trust/path-policy tests;
-- macOS Seatbelt profile-order tests that run without a macOS host;
-- Linux end-to-end final-deny tests when run on Linux;
-- local-runtime resolution and schema tests.
+### Runtime upgrade checklist
 
-The runtime's original full test suite uses Bun (`npm --prefix sandbox-runtime test`) when Bun is available.
+1. Read the Sandbox Runtime release notes and security-relevant source changes.
+2. Update the exact dependency version and lockfile; do not use a caret range.
+3. Verify the packaged seccomp helpers and JVM agent.
+4. Run formatting, lint, type-checking, and all tests on Linux and macOS.
+5. Review runtime schema changes for trusted/project authority implications.
+6. Publish only after hard-deny and fail-closed tests pass.
 
 ## Acknowledgements
 
-Based on Pi's sandbox extension example by Mario Zechner and Anthropic's Sandbox Runtime, under their respective licenses.
+Based on Pi's sandbox extension example by Mario Zechner and [Anthropic Sandbox Runtime](https://github.com/anthropics/sandbox-runtime), under their respective licenses.

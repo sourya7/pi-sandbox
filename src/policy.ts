@@ -28,21 +28,39 @@ export function shouldPromptForWrite(
   return allowWrite.length === 0 || !matches(path, allowWrite);
 }
 
-export function domainMatchesPattern(domain: string, pattern: string): boolean {
-  if (pattern === "*") return true;
-  if (pattern.startsWith("*.")) {
-    const base = pattern.slice(2);
-    return domain === base || domain.endsWith("." + base);
+function splitDomainPort(value: string): { host: string; port?: number } {
+  if (value.startsWith("[")) {
+    const close = value.indexOf("]");
+    if (close !== -1) {
+      const suffix = value.slice(close + 1);
+      return {
+        host: value.slice(1, close),
+        ...(suffix.startsWith(":") ? { port: Number(suffix.slice(1)) } : {}),
+      };
+    }
   }
-  return domain === pattern;
+  const match = value.match(/^(.*):([1-9][0-9]{0,4})$/);
+  return match ? { host: match[1], port: Number(match[2]) } : { host: value };
+}
+
+export function domainMatchesPattern(domain: string, pattern: string, port?: number): boolean {
+  const destination = splitDomainPort(domain);
+  const rule = splitDomainPort(pattern);
+  const destinationPort = port ?? destination.port;
+  if (rule.port !== undefined && rule.port !== destinationPort) return false;
+  const host = destination.host.toLowerCase();
+  const hostPattern = rule.host.toLowerCase();
+  if (hostPattern === "*") return true;
+  if (hostPattern.startsWith("*.")) return host.endsWith(hostPattern.slice(1));
+  return host === hostPattern;
 }
 
 export function allowsAllDomains(allowedDomains: string[] | undefined): boolean {
   return allowedDomains?.includes("*") ?? false;
 }
 
-export function domainIsAllowed(domain: string, allowedDomains: string[]): boolean {
-  return allowedDomains.some((pattern) => domainMatchesPattern(domain, pattern));
+export function domainIsAllowed(domain: string, allowedDomains: string[], port?: number): boolean {
+  return allowedDomains.some((pattern) => domainMatchesPattern(domain, pattern, port));
 }
 
 export function resolveLexicalPath(filePath: string, cwd = process.cwd()): string {
