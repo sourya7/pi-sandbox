@@ -16,7 +16,7 @@ import {
   type OtherwisePolicy,
 } from "./modes.ts";
 import { allowsAllDomains } from "./policy.ts";
-import { type SessionAllowances } from "./sandbox-runtime.ts";
+import { resolveRuntimeProtectedWritePaths, type SessionAllowances } from "./sandbox-runtime.ts";
 import { type ExactSessionOverride } from "./session-overrides.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
@@ -361,6 +361,16 @@ export function formatSandboxConfiguration(
   const effectiveWrite = categorical.write
     ? "(none; denied by legacy mode)"
     : config.filesystem.allowWrite.join(", ") || "(none)";
+  const runtimeProtection = resolveRuntimeProtectedWritePaths(
+    loaded.protectedWritePaths,
+    loaded.projectRoot,
+  );
+  const projectPolicyPaths = [paths.projectBasePath, paths.projectModePath].filter(
+    (path): path is string => path !== undefined,
+  );
+  const deferredProjectPolicy = runtimeProtection.deferredPaths.filter((path) =>
+    projectPolicyPaths.includes(path),
+  );
   return [
     "Sandbox Configuration",
     `  State: ${state}`,
@@ -424,7 +434,14 @@ export function formatSandboxConfiguration(
           "      lifetime: active mode and session only",
         ])
       : ["    (none)"]),
-    `  Protected policy files: ${loaded.protectedWritePaths.join(", ")}`,
+    `  Protected policy files: ${loaded.protectedWritePaths.join(", ") || "(none)"}`,
+    `  Runtime protected paths: ${runtimeProtection.runtimePaths.join(", ") || "(none)"}`,
+    `  Deferred absent policy paths: ${runtimeProtection.deferredPaths.join(", ") || "(none)"}`,
+    ...(deferredProjectPolicy.length
+      ? [
+          "  ⚠️ A project policy path is absent with no narrow runtime mount point. Sandboxed Bash may create it, but it cannot change this session's policy snapshot; future access requests still require approval.",
+        ]
+      : []),
     "",
     "Isolation controls:",
     `  Filesystem disabled: ${config.filesystem.disabled === true ? "YES" : "no"}`,

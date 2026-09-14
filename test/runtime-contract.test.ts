@@ -191,35 +191,85 @@ test(
 );
 
 test(
-  "Linux accepts and enforces a non-existent denyWrite leaf",
+  "Linux writable project starts without absent default or policy placeholders",
   { skip: process.platform !== "linux" },
   async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-missing-deny-"));
-    const denied = join(root, "future.txt");
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-missing-policy-"));
+    const output = join(root, "output.txt");
+    const projectPolicy = join(root, ".pi", "sandbox.json");
     const shell = process.env.SHELL ?? "bash";
-    await SandboxManager.initialize(
+    const runtime = buildRuntimeConfig(
       {
-        network: { allowedDomains: [], deniedDomains: [], allowAllUnixSockets: true },
-        filesystem: {
-          denyRead: [],
-          allowRead: [],
-          allowWrite: [root],
-          denyWrite: [denied],
-        },
+        ...DEFAULT_CONFIG,
+        network: { ...DEFAULT_CONFIG.network, allowedDomains: [], allowAllUnixSockets: true },
+        filesystem: { ...DEFAULT_CONFIG.filesystem, allowWrite: [root] },
       },
       undefined,
-      false,
+      root,
+      [projectPolicy],
+      [shell],
     );
+    assert.equal(runtime.filesystem.denyWrite.includes(projectPolicy), false);
+    assert.equal(runtime.filesystem.denyWrite.includes(root), false);
+
+    await SandboxManager.initialize(runtime, undefined, false);
     try {
       const wrapped = await SandboxManager.wrapWithSandbox(
-        `printf BLOCKED > ${JSON.stringify(denied)} 2>/dev/null || true`,
+        `printf OK > ${JSON.stringify(output)}`,
         shell,
       );
       await execFileAsync(shell, ["-c", wrapped]);
-      // The runtime creates an empty host mount-point stub for an absent deny.
-      assert.equal(readFileSync(denied, "utf8"), "");
+      assert.equal(readFileSync(output, "utf8"), "OK");
+      assert.equal(existsSync(join(root, ".env")), false);
+      assert.equal(existsSync(join(root, ".pi")), false);
+    } finally {
       SandboxManager.cleanupAfterCommand();
-      assert.equal(existsSync(denied), false);
+      await SandboxManager.reset();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Linux protects existing deny files and existing policy directories",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-existing-protection-"));
+    const environment = join(root, ".env");
+    const policyDirectory = join(root, ".pi");
+    const projectPolicy = join(policyDirectory, "sandbox.json");
+    const sibling = join(policyDirectory, "planted.json");
+    const shell = process.env.SHELL ?? "bash";
+    writeFileSync(environment, "ORIGINAL");
+    mkdirSync(policyDirectory);
+    const runtime = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        network: { ...DEFAULT_CONFIG.network, allowedDomains: [], allowAllUnixSockets: true },
+        filesystem: {
+          ...DEFAULT_CONFIG.filesystem,
+          allowWrite: [root],
+          denyWrite: [environment],
+        },
+      },
+      undefined,
+      root,
+      [projectPolicy],
+      [shell],
+    );
+    assert.equal(runtime.filesystem.denyWrite.includes(environment), true);
+    assert.equal(runtime.filesystem.denyWrite.includes(policyDirectory), true);
+
+    await SandboxManager.initialize(runtime, undefined, false);
+    try {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `printf CHANGED > ${JSON.stringify(environment)} 2>/dev/null || true; printf PLANTED > ${JSON.stringify(projectPolicy)} 2>/dev/null || true; printf SIBLING > ${JSON.stringify(sibling)} 2>/dev/null || true`,
+        shell,
+      );
+      await execFileAsync(shell, ["-c", wrapped]);
+      assert.equal(readFileSync(environment, "utf8"), "ORIGINAL");
+      assert.equal(existsSync(projectPolicy), false);
+      assert.equal(existsSync(sibling), false);
     } finally {
       SandboxManager.cleanupAfterCommand();
       await SandboxManager.reset();

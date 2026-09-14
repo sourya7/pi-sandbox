@@ -60,12 +60,13 @@ test("deepMerge merges sections while adding configured arrays", () => {
   assert.equal(merged.filesystem?.allowRead?.includes("/docs"), true);
   assert.equal(merged.filesystem?.allowWrite?.includes("/tmp"), true);
   assert.equal(merged.filesystem?.allowWrite?.includes("/work"), true);
-  assert.equal(merged.filesystem?.denyWrite?.includes(".env"), true);
+  assert.equal(merged.filesystem?.denyWrite?.includes(".env"), false);
   assert.equal(merged.filesystem?.denyWrite?.includes("*.secret"), true);
 });
 
 test("built-in defaults do not hard-deny normal home directory projects", () => {
   assert.deepEqual(DEFAULT_CONFIG.filesystem?.denyRead, []);
+  assert.deepEqual(DEFAULT_CONFIG.filesystem?.denyWrite, []);
 });
 
 test("a later merge adds to global configuration without erasing it", () => {

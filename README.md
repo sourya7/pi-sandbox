@@ -165,6 +165,8 @@ Literal read allowances preserve symlink aliases and their resolved targets, inc
 
 V2 and v3 filesystem rules support literal paths and trailing `/**` subtree notation. Other security-critical globs are rejected because Linux and macOS cannot guarantee identical behavior for them.
 
+`.env` is not an unconditional built-in write deny. Add it to `filesystem.write.deny` (v3) or `filesystem.denyWrite` (v2) when the file exists and the policy should protect it. On Linux, the pinned runtime cannot safely construct a deny mount for an absent explicit deny beneath an effective writable path. Sandbox initialization therefore fails with an actionable error instead of silently dropping the deny or repeatedly failing inside bubblewrap. Create the target before startup, narrow the write allowlist, or remove the deny. A narrow write allowlist that does not cover the absent target makes the deny redundant and avoids this limitation.
+
 ### Migrating from policy version 2 or the earlier v3 draft
 
 Version 2 remains compatible for the legacy `default`, `read-only`, and `build` modes. Custom v2 mode names do not fall back to default.
@@ -238,8 +240,10 @@ Reactive “Allow for this project” grants remain separate in `<project-id>[.<
 
 - Project `.pi/sandbox*.json` is used only when Pi reports the project trusted.
 - Session grants remain in memory.
-- Active global, project, mode, reactive-grant, and request-approval files are write-protected from model tools and sandboxed bash.
-- `/sandbox` reports project requests, their sources and statuses, declared approvals, and reactive grants separately.
+- Existing active global, project, mode, reactive-grant, and request-approval files are write-protected from model tools and sandboxed bash.
+- Every logical policy/control path, including an absent one, remains write-protected and non-overridable through Pi's exact `write` and `edit` tools.
+- On Linux, an absent policy file is protected in Bash by its existing immediate policy directory. If both the project policy and `.pi/` are absent, there is no narrow mount point, so Bash may create `.pi/sandbox.json`. It cannot change the active policy snapshot or directly grant future capabilities: project allows still require approval, project fallback controls are ignored, project hard denies can only restrict access, and malformed policy fails closed on the next load. This is a future-session integrity/availability limitation, not a live-session capability escalation.
+- `/sandbox` reports project requests, their sources and statuses, declared approvals, reactive grants, complete logical policy protection, runtime-protected paths, and deferred absent policy paths separately.
 - Policy is validated and snapshotted. It is not reread before every tool call.
 
 Global configuration is the place for powerful controls such as `filesystem.disabled`, wildcard domains, Unix socket access, Apple Events, or weaker isolation flags. `enableWeakerNetworkIsolation` is false by default. Global hard denies remain authoritative over every project approval; no global delegation setting is required.

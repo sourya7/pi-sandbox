@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
   extractBlockedWritePath,
   extractSandboxViolation,
   filterDenyWriteForRuntime,
+  resolveRuntimeProtectedWritePaths,
   supportsNodeEnvProxy,
 } from "../src/sandbox-runtime.ts";
 import {
@@ -72,6 +73,7 @@ test("v3 replacement profile reaches runtime without inherited project grants", 
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v3-runtime-profile-"));
   try {
     const secret = join(cwd, "secret");
+    writeFileSync(secret, "secret");
     const base = {
       ...DEFAULT_CONFIG,
       filesystem: {
@@ -125,35 +127,79 @@ test("buildRuntimeConfig preserves a symlink allow path and its canonical target
   }
 });
 
-test("buildRuntimeConfig filters non-existent denyWrite leaves under unwritable parents", () => {
+test("filterDenyWriteForRuntime omits an absent deny outside effective writes", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
-  chmodSync(cwd, 0o555);
-  try {
-    const runtime = buildRuntimeConfig(
-      { ...DEFAULT_CONFIG, filesystem: { ...DEFAULT_CONFIG.filesystem, denyWrite: [".env"] } },
-      undefined,
-      cwd,
-    );
-    assert.deepEqual(runtime.filesystem?.denyWrite, []);
-  } finally {
-    chmodSync(cwd, 0o755);
-  }
+  assert.deepEqual(filterDenyWriteForRuntime(["secret"], [join(cwd, "output")], cwd, "linux"), []);
 });
 
-test("filterDenyWriteForRuntime keeps non-existent denyWrite leaves under writable parents", () => {
+test("filterDenyWriteForRuntime rejects an absent deny beneath an effective write", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
-  assert.deepEqual(filterDenyWriteForRuntime([".env"], cwd), [".env"]);
+  assert.throws(
+    () => filterDenyWriteForRuntime([".env"], [cwd], cwd, "linux"),
+    /Cannot enforce nonexistent deny-write path.*\.env.*beneath writable path/,
+  );
+  assert.throws(
+    () => filterDenyWriteForRuntime([".env/**"], [cwd], cwd, "linux"),
+    /Cannot enforce nonexistent deny-write path.*\.env.*beneath writable path/,
+  );
 });
 
-test("filterDenyWriteForRuntime keeps glob patterns", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
-  assert.deepEqual(filterDenyWriteForRuntime([".env.*", "*.pem"], cwd), [".env.*", "*.pem"]);
+test("filterDenyWriteForRuntime rejects canonical symlink overlap", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-link-"));
+  const target = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-target-"));
+  const link = join(cwd, "link");
+  symlinkSync(target, link);
+  assert.throws(
+    () => filterDenyWriteForRuntime([join(link, "secret")], [link], cwd, "linux"),
+    new RegExp(`Cannot enforce nonexistent deny-write path.*${target}`),
+  );
 });
 
 test("filterDenyWriteForRuntime keeps existing denyWrite paths", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-"));
   mkdirSync(join(cwd, ".env"));
-  assert.deepEqual(filterDenyWriteForRuntime([".env"], cwd), [".env"]);
+  assert.deepEqual(filterDenyWriteForRuntime([".env"], [cwd], cwd, "linux"), [".env"]);
+});
+
+test("runtime protected paths use only existing narrow mount targets", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-protected-"));
+  const policyDirectory = join(cwd, ".pi");
+  const existingPolicy = join(policyDirectory, "sandbox.json");
+  mkdirSync(policyDirectory);
+  writeFileSync(existingPolicy, "{}");
+
+  assert.deepEqual(resolveRuntimeProtectedWritePaths([existingPolicy], cwd, "linux"), {
+    runtimePaths: [existingPolicy],
+    deferredPaths: [],
+  });
+  rmSync(existingPolicy);
+  assert.deepEqual(resolveRuntimeProtectedWritePaths([existingPolicy], cwd, "linux"), {
+    runtimePaths: [policyDirectory],
+    deferredPaths: [],
+  });
+  rmSync(policyDirectory, { recursive: true });
+  assert.deepEqual(resolveRuntimeProtectedWritePaths([existingPolicy], cwd, "linux"), {
+    runtimePaths: [],
+    deferredPaths: [existingPolicy],
+  });
+});
+
+test("runtime protected paths never fall back broadly and reduce descendants", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-protected-reduce-"));
+  const policyDirectory = join(cwd, ".pi");
+  const existingPolicy = join(policyDirectory, "sandbox.json");
+  const absentSibling = join(policyDirectory, "sandbox.audit.json");
+  const absentDeep = join(cwd, "missing", "sandbox.json");
+  mkdirSync(policyDirectory);
+  writeFileSync(existingPolicy, "{}");
+  const logical = [existingPolicy, existingPolicy, absentSibling, absentDeep];
+  const snapshot = [...logical];
+
+  assert.deepEqual(resolveRuntimeProtectedWritePaths(logical, cwd, "linux"), {
+    runtimePaths: [policyDirectory],
+    deferredPaths: [absentDeep],
+  });
+  assert.deepEqual(logical, snapshot);
 });
 
 test("extractBlockedWritePath recognizes sandbox violation annotations", () => {
@@ -208,6 +254,7 @@ test("exact override derivation removes only the selected specific runtime deny"
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-override-"));
   const target = join(cwd, ".env");
   const sibling = join(cwd, ".env.local");
+  writeFileSync(sibling, "sibling");
   const override: ExactSessionOverride = {
     operation: "read",
     configuredValue: ".env",
@@ -242,6 +289,7 @@ test("v2 runtime config keeps user denyRead more specific than scope allows", ()
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-v2-runtime-"));
   const secret = join(cwd, "secret");
   const policyFile = join(cwd, ".pi", "sandbox.json");
+  writeFileSync(secret, "secret");
   const runtime = buildRuntimeConfig(
     {
       ...DEFAULT_CONFIG,
@@ -261,12 +309,13 @@ test("v2 runtime config keeps user denyRead more specific than scope allows", ()
   assert.equal(runtime.filesystem?.denyRead?.includes("/"), true);
   assert.equal(runtime.filesystem?.denyRead?.includes(secret), true);
   assert.equal(runtime.filesystem?.denyWrite.includes(secret), true);
-  assert.equal(runtime.filesystem?.denyWrite.includes(policyFile), true);
+  assert.equal(runtime.filesystem?.denyWrite.includes(policyFile), process.platform !== "linux");
 });
 
 test("credential file deny rules use specific runtime read denies", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-credential-runtime-"));
   const credential = join(cwd, "token");
+  writeFileSync(credential, "token");
   const runtime = buildRuntimeConfig(
     {
       ...DEFAULT_CONFIG,

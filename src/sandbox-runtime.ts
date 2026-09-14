@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants, existsSync, accessSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -43,31 +43,69 @@ function resolveConfigPath(pattern: string, cwd: string): string {
   return resolve(join(cwd, pattern));
 }
 
-function deepestExistingAncestor(path: string): string | null {
-  let current = dirname(path);
-  while (current && current !== dirname(current)) {
-    if (existsSync(current)) return current;
-    current = dirname(current);
-  }
-  return existsSync(current) ? current : null;
+function pathIsWithin(path: string, ancestor: string): boolean {
+  return path === ancestor || ancestor === "/" || path.startsWith(`${ancestor}/`);
 }
 
-function isWritable(path: string): boolean {
-  try {
-    accessSync(path, constants.W_OK);
-    return true;
-  } catch {
-    return false;
-  }
+function withoutSubtree(pattern: string): string {
+  return pattern.endsWith("/**") ? pattern.slice(0, -3) || "/" : pattern;
 }
 
-export function filterDenyWriteForRuntime(denyWrite: string[], cwd: string): string[] {
+export interface RuntimeProtectedWritePathResolution {
+  runtimePaths: string[];
+  deferredPaths: string[];
+}
+
+/** Derive mountable Linux protection targets from the immutable logical policy
+ * paths. Only the immediate policy directory may substitute for an absent
+ * policy file; falling back to a broader existing ancestor could freeze the
+ * project root or home directory. */
+export function resolveRuntimeProtectedWritePaths(
+  protectedPaths: string[],
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): RuntimeProtectedWritePathResolution {
+  const logicalPaths = [...new Set(protectedPaths.map((path) => canonicalizePath(path, cwd)))];
+  if (platform !== "linux") return { runtimePaths: logicalPaths, deferredPaths: [] };
+
+  const candidates: string[] = [];
+  const deferredPaths: string[] = [];
+  for (const path of logicalPaths) {
+    if (existsSync(path)) {
+      candidates.push(canonicalizePath(path, cwd));
+      continue;
+    }
+    const parent = dirname(path);
+    if (existsSync(parent)) candidates.push(canonicalizePath(parent, cwd));
+    else deferredPaths.push(path);
+  }
+  const runtimePaths = removeRedundantDescendants([...new Set(candidates)]);
+  return { runtimePaths, deferredPaths };
+}
+
+/** Linux cannot safely mount an absent deny target below a writable path.
+ * Such a configured hard deny must fail closed rather than being silently
+ * removed. An absent target outside all effective writes is redundant. */
+export function filterDenyWriteForRuntime(
+  denyWrite: string[],
+  writePaths: string[],
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform !== "linux") return denyWrite;
+  const resolvedWrites = uniquePaths(writePaths, cwd);
   return denyWrite.filter((pattern) => {
-    if (pattern.includes("*")) return true;
-    const resolved = resolveConfigPath(pattern, cwd);
-    if (existsSync(resolved)) return true;
-    const ancestor = deepestExistingAncestor(resolved);
-    return !ancestor || isWritable(ancestor);
+    const raw = withoutSubtree(pattern);
+    const lexical = resolveConfigPath(raw, cwd);
+    if (existsSync(lexical)) return true;
+    const resolved = canonicalizePath(raw, cwd);
+    const coveringWrite = resolvedWrites.find((writePath) => pathIsWithin(resolved, writePath));
+    if (coveringWrite) {
+      throw new Error(
+        `Cannot enforce nonexistent deny-write path "${resolved}" beneath writable path "${coveringWrite}" with the installed Linux sandbox runtime. Create the target before startup, narrow filesystem.write.allow, or remove the deny rule.`,
+      );
+    }
+    return false;
   });
 }
 
@@ -174,8 +212,11 @@ export function buildRuntimeConfig(
     cwd,
   );
   const hardRead = uniquePaths([...filesystem.denyRead, ...credentialHardRead], cwd);
+  const configuredDenyWrite = filterDenyWriteForRuntime(filesystem.denyWrite, writePaths, cwd);
+  const hardReadWriteProtection = filterDenyWriteForRuntime(hardRead, writePaths, cwd);
+  const runtimeProtection = resolveRuntimeProtectedWritePaths(protectedWritePaths, cwd);
   const denyWrite = uniquePaths(
-    [...filesystem.denyWrite, ...hardRead, ...protectedWritePaths],
+    [...configuredDenyWrite, ...hardReadWriteProtection, ...runtimeProtection.runtimePaths],
     cwd,
   );
   return {
@@ -193,7 +234,7 @@ export function buildRuntimeConfig(
       denyRead: [...new Set([...scopeDeny, ...hardRead])],
       allowRead: [...new Set([...configuredRead, ...bootstrap])],
       allowWrite: writePaths,
-      denyWrite: filterDenyWriteForRuntime(denyWrite, cwd),
+      denyWrite,
     },
     credentials: config.credentials,
     ignoreViolations: config.ignoreViolations,

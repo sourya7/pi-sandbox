@@ -260,6 +260,7 @@ test("operator-confirmed exact overrides refresh, diagnose, and clear without ag
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const target = join(projectRoot, ".env");
+  writeFileSync(target, "secret");
   writeFileSync(
     join(agentDir, "sandbox.json"),
     JSON.stringify({
@@ -345,6 +346,7 @@ test("RPC can confirm an exact override while JSON mode fails closed", async (t)
   const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-override-rpc-agent-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(join(projectRoot, ".env"), "secret");
   writeFileSync(
     join(agentDir, "sandbox.json"),
     JSON.stringify({
@@ -573,6 +575,191 @@ test("failed dynamic mode switches preserve the active runtime and policy snapsh
     rmSync(agentDir, { recursive: true, force: true });
   }
 });
+
+test(
+  "mode refresh recomputes runtime protection when the project policy directory appears",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-refresh-protection-project-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-refresh-protection-agent-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const base = {
+      policyVersion: 3,
+      network: { allow: [], deny: [], otherwise: "deny" },
+      filesystem: {
+        read: { scope: "home", allow: ["."], deny: [], otherwise: "prompt" },
+        write: { allow: ["."], deny: [], otherwise: "prompt" },
+      },
+    };
+    writeFileSync(join(agentDir, "sandbox.json"), JSON.stringify(base));
+    writeFileSync(join(agentDir, "sandbox.audit.json"), JSON.stringify({ policyVersion: 3 }));
+    const runtimeConfigs: SandboxRuntimeConfig[] = [];
+    t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+      runtimeConfigs.push(config);
+    });
+    t.mock.method(SandboxManager, "reset", async () => undefined);
+    const events: string[] = [];
+    const notifications: string[] = [];
+
+    try {
+      const harness = createExtensionHarness();
+      const ctx = createContext(projectRoot, {
+        hasUI: false,
+        mode: "json",
+        events,
+        notifications,
+      });
+      await emit(harness, "session_start", { reason: "startup" }, ctx);
+      const policyDirectory = join(projectRoot, ".pi");
+      assert.equal(runtimeConfigs[0]?.filesystem.denyWrite.includes(policyDirectory), false);
+
+      mkdirSync(policyDirectory);
+      await harness.commands.get("sandbox-mode")?.handler("audit", ctx);
+      assert.equal(runtimeConfigs.at(-1)?.filesystem.denyWrite.includes(policyDirectory), true);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(projectRoot, { recursive: true, force: true });
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "failed deny validation restores the previous runtime and remains active",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-refresh-validation-project-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-refresh-validation-agent-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const output = join(projectRoot, "output");
+    const absentDeny = join(projectRoot, "secret");
+    mkdirSync(output);
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 3,
+        network: { allow: [], deny: [], otherwise: "deny" },
+        filesystem: {
+          read: { scope: "home", allow: [output], deny: [], otherwise: "prompt" },
+          write: { allow: [output], deny: [absentDeny], otherwise: "prompt" },
+        },
+      }),
+    );
+    const runtimeConfigs: SandboxRuntimeConfig[] = [];
+    let resetCount = 0;
+    t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+      runtimeConfigs.push(config);
+    });
+    t.mock.method(SandboxManager, "reset", async () => {
+      resetCount++;
+    });
+    t.mock.method(SandboxManager, "getConfig", () => runtimeConfigs.at(-1));
+    const events: string[] = [];
+    const notifications: string[] = [];
+
+    try {
+      const harness = createExtensionHarness();
+      const ctx = createContext(projectRoot, {
+        hasUI: true,
+        mode: "tui",
+        confirmations: [true],
+        events,
+        notifications,
+      });
+      await emit(harness, "session_start", { reason: "startup" }, ctx);
+      const previousRuntime = runtimeConfigs[0];
+      await assert.rejects(
+        () => harness.commands.get("sandbox-allow-write")!.handler(projectRoot, ctx),
+        /Cannot enforce nonexistent deny-write path.*secret/,
+      );
+      assert.equal(resetCount, 2);
+      assert.deepEqual(runtimeConfigs.at(-1), previousRuntime);
+
+      await harness.commands.get("sandbox")?.handler("", ctx);
+      assert.match(notifications.at(-1) ?? "", /State: active/);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(projectRoot, { recursive: true, force: true });
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "absent project policy remains exact-tool protected and is reported as deferred",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-absent-policy-project-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-absent-policy-agent-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        policyVersion: 2,
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          readScope: "home",
+          denyRead: [],
+          allowRead: ["."],
+          allowWrite: ["."],
+          denyWrite: [],
+        },
+      }),
+    );
+    let runtimeConfig: SandboxRuntimeConfig | undefined;
+    t.mock.method(SandboxManager, "initialize", async (config: SandboxRuntimeConfig) => {
+      runtimeConfig = config;
+    });
+    const events: string[] = [];
+    const notifications: string[] = [];
+
+    try {
+      const harness = createExtensionHarness();
+      const ctx = createContext(projectRoot, {
+        hasUI: true,
+        mode: "tui",
+        events,
+        notifications,
+      });
+      await emit(harness, "session_start", { reason: "startup" }, ctx);
+      const projectPolicy = join(projectRoot, ".pi", "sandbox.json");
+      assert.ok(runtimeConfig);
+      assert.equal(runtimeConfig.filesystem.denyWrite.includes(projectPolicy), false);
+      assert.equal(runtimeConfig.filesystem.denyWrite.includes(projectRoot), false);
+
+      const toolCall = harness.handlers.get("tool_call")?.[0];
+      assert.ok(toolCall);
+      for (const toolName of ["write", "edit"]) {
+        const blocked = (await toolCall(
+          { type: "tool_call", toolName, input: { path: projectPolicy, content: "{}" } },
+          ctx,
+        )) as any;
+        assert.equal(blocked.block, true);
+        assert.match(blocked.reason, /hard-denies writes/);
+      }
+
+      await harness.commands.get("sandbox-allow-write")?.handler(projectPolicy, ctx);
+      assert.match(notifications.at(-1) ?? "", /non-overridable sandbox protection/);
+      await harness.commands.get("sandbox")?.handler("", ctx);
+      assert.match(
+        notifications.at(-1) ?? "",
+        /Deferred absent policy paths: .*\.pi\/sandbox\.json/,
+      );
+      assert.match(notifications.at(-1) ?? "", /cannot change this session's policy snapshot/);
+      assert.equal(existsSync(join(projectRoot, ".pi")), false);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(projectRoot, { recursive: true, force: true });
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("non-interactive session startup initializes with pending project requests blocked", async (t) => {
   const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-lifecycle-project-"));

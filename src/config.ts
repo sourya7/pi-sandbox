@@ -129,7 +129,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     allowRead: ["."],
     allowWrite: [".", "/tmp"],
     // Filesystem rules intentionally use portable literal/subtree paths.
-    denyWrite: [".env"],
+    denyWrite: [],
   },
 };
 

@@ -75,6 +75,15 @@ test("configuration distinguishes configured and effective denies", () => {
   assert.match(output, /Effective hard deny read:  \(none\)/);
   assert.match(output, /read: \/project\/\.env/);
   assert.match(output, /removed: denyRead \.env/);
+  assert.match(output, /Protected policy files: \/project\/\.pi\/sandbox\.json/);
+  if (process.platform === "linux") {
+    assert.match(output, /Runtime protected paths: \(none\)/);
+    assert.match(output, /Deferred absent policy paths: \/project\/\.pi\/sandbox\.json/);
+    assert.match(output, /cannot change this session's policy snapshot/);
+  } else {
+    assert.match(output, /Runtime protected paths: \/project\/\.pi\/sandbox\.json/);
+    assert.match(output, /Deferred absent policy paths: \(none\)/);
+  }
 });
 
 test("configuration reports data-driven mode provenance and config load states", () => {
