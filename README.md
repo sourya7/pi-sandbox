@@ -265,9 +265,16 @@ Pi's built-in `grep` and `find` implementations spawn local `rg`/`fd` processes 
 - Commands are never automatically retried after a grant because they may already have performed writes or other side effects.
 - The agent can call `request_sandbox_access` with an explicit operation, path, and reason. The tool always requires user approval.
 
-### User `!cmd`
+### User `!cmd` and `!!cmd`
 
-`!cmd` remains sandboxed and uses Pi's cancellation-preserving execution path. It does not attempt unreliable automatic read escalation. Use:
+Pi's two interactive user-bash forms have intentionally different boundaries while the sandbox is enabled:
+
+- `!cmd` is an explicit operator escape hatch. Pi runs it through its normal local backend with host permissions and sends its output to the agent context.
+- `!!cmd` is diagnostic sandbox execution. This extension runs it through Sandbox Runtime and Pi excludes its output from agent context.
+
+The model cannot invoke the `!cmd` path itself; only the operator can initiate it through Pi's interactive user-bash operation. Model-facing `bash` and filesystem tools remain sandboxed and fail closed. Sandbox initialization or failure blocks `!!cmd` but does not block the explicit `!cmd` host escape hatch. When sandboxing is explicitly disabled with `--no-sandbox` or `/sandbox-disable`, both forms use Pi's normal local backend.
+
+Sandboxed `!!cmd` does not attempt unreliable automatic read escalation. To test or enable a sandboxed operation, use:
 
 ```text
 /sandbox-allow-read <path>

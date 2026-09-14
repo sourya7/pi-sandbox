@@ -71,6 +71,9 @@ test("configuration distinguishes configured and effective denies", () => {
     effective,
     [override],
   );
+  assert.match(output, /User bash boundary: !cmd is host\/unsandboxed; !!cmd is sandboxed/);
+  assert.match(output, /Network \(agent bash \+ !!cmd\):/);
+  assert.doesNotMatch(output, /sandboxed bash \+ !cmd/);
   assert.match(output, /Configured hard deny read: \.env/);
   assert.match(output, /Effective hard deny read:  \(none\)/);
   assert.match(output, /read: \/project\/\.env/);

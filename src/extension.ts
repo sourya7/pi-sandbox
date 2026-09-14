@@ -808,7 +808,8 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("user_bash", async () => {
+  pi.on("user_bash", async (event) => {
+    if (event.excludeFromContext === false) return;
     if (state === "active") {
       const operations = createSandboxedBashOps(userShellPath);
       return {

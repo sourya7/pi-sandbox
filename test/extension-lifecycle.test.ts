@@ -234,7 +234,15 @@ test("RPC startup defers project review and blocks bash until initialization", a
 
     const userBash = harness.handlers.get("user_bash")?.[0];
     assert.ok(userBash);
-    const blocked = (await userBash({ type: "user_bash", command: "pwd" }, ctx)) as any;
+    const hostFallback = await userBash(
+      { type: "user_bash", command: "pwd", excludeFromContext: false },
+      ctx,
+    );
+    assert.equal(hostFallback, undefined);
+    const blocked = (await userBash(
+      { type: "user_bash", command: "pwd", excludeFromContext: true },
+      ctx,
+    )) as any;
     assert.equal(blocked.result.exitCode, 126);
     assert.match(blocked.result.output, /sandbox state is initializing/);
 
@@ -249,6 +257,77 @@ test("RPC startup defers project review and blocks bash until initialization", a
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     if (previousNodeProxy === undefined) delete process.env.NODE_USE_ENV_PROXY;
     else process.env.NODE_USE_ENV_PROXY = previousNodeProxy;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("active sandbox routes single bang locally and intercepts double bang", async (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-user-bash-active-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-user-bash-active-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writePolicies(projectRoot, agentDir, `user-bash-active-${process.pid}`);
+  t.mock.method(SandboxManager, "initialize", async () => undefined);
+
+  try {
+    const harness = createExtensionHarness();
+    const ctx = createContext(projectRoot, {
+      hasUI: false,
+      mode: "json",
+      events: [],
+      notifications: [],
+    });
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+
+    const userBash = harness.handlers.get("user_bash")?.[0];
+    assert.ok(userBash);
+    assert.equal(
+      await userBash({ type: "user_bash", command: "pwd", excludeFromContext: false }, ctx),
+      undefined,
+    );
+    const sandboxed = (await userBash(
+      { type: "user_bash", command: "pwd", excludeFromContext: true },
+      ctx,
+    )) as any;
+    assert.equal(typeof sandboxed.operations.exec, "function");
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("explicitly disabled sandbox routes both bang forms locally", async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-user-bash-disabled-project-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-user-bash-disabled-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writePolicies(projectRoot, agentDir, `user-bash-disabled-${process.pid}`);
+
+  try {
+    const harness = createExtensionHarness();
+    harness.pi.setFlag("no-sandbox", true);
+    const ctx = createContext(projectRoot, {
+      hasUI: false,
+      mode: "json",
+      events: [],
+      notifications: [],
+    });
+    await emit(harness, "session_start", { reason: "startup" }, ctx);
+
+    const userBash = harness.handlers.get("user_bash")?.[0];
+    assert.ok(userBash);
+    for (const excludeFromContext of [false, true]) {
+      assert.equal(
+        await userBash({ type: "user_bash", command: "pwd", excludeFromContext }, ctx),
+        undefined,
+      );
+    }
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     rmSync(projectRoot, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
   }

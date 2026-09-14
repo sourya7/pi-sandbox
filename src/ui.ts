@@ -374,6 +374,7 @@ export function formatSandboxConfiguration(
   return [
     "Sandbox Configuration",
     `  State: ${state}`,
+    "  User bash boundary: !cmd is host/unsandboxed; !!cmd is sandboxed while enabled",
     `  Policy version: ${loaded.policyVersion}`,
     `  Active mode: ${mode}`,
     `  Project policy trusted: ${loaded.projectTrusted ? "yes" : "no"}`,
@@ -397,7 +398,7 @@ export function formatSandboxConfiguration(
     "",
     ...formatProjectRequestDiagnostics(projectRequestState),
     "",
-    "Network (sandboxed bash + !cmd):",
+    "Network (agent bash + !!cmd):",
     `  Direct profile allowed: ${loaded.directConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
     `  Reactive project allowed: ${loaded.reactiveProjectGrant?.network?.allowedDomains?.join(", ") || "(none)"}`,
     `  Effective allowed: ${effectiveDomains}`,
